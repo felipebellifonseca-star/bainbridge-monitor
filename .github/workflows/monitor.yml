@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "2-59/5 * * * *"
   workflow_dispatch:
+    inputs:
+      teste:
+        description: "Enviar teste no Telegram"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -29,22 +35,58 @@ jobs:
       - name: Instalar dependências
         run: pip install -r requirements.txt
 
+      - name: Healthchecks - início
+        continue-on-error: true
+        env:
+          HEALTHCHECKS_PING_URL: ${{ secrets.HEALTHCHECKS_PING_URL }}
+        shell: bash
+        run: |
+          if [[ -n "$HEALTHCHECKS_PING_URL" ]]; then
+            curl -fsS --max-time 10 --retry 3 "$HEALTHCHECKS_PING_URL/start" || true
+          else
+            echo "Healthchecks ainda não configurado."
+          fi
+
       - name: Verificar B1 e B2
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MAX_RENT: "2700"
+          TEST_MODE: ${{ inputs.teste }}
         run: python monitor.py
 
-      - name: Salvar novo estado
+      - name: Salvar estado
+        if: always()
         shell: bash
         run: |
           if [[ -n "$(git status --porcelain -- state.json)" ]]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add state.json
-            git commit -m "Update Bainbridge availability state"
+            git commit -m "Update Bainbridge monitor state"
             git push
           else
             echo "state.json sem alterações."
+          fi
+
+      - name: Healthchecks - sucesso
+        if: success()
+        continue-on-error: true
+        env:
+          HEALTHCHECKS_PING_URL: ${{ secrets.HEALTHCHECKS_PING_URL }}
+        shell: bash
+        run: |
+          if [[ -n "$HEALTHCHECKS_PING_URL" ]]; then
+            curl -fsS --max-time 10 --retry 3 "$HEALTHCHECKS_PING_URL" || true
+          fi
+
+      - name: Healthchecks - falha
+        if: failure()
+        continue-on-error: true
+        env:
+          HEALTHCHECKS_PING_URL: ${{ secrets.HEALTHCHECKS_PING_URL }}
+        shell: bash
+        run: |
+          if [[ -n "$HEALTHCHECKS_PING_URL" ]]; then
+            curl -fsS --max-time 10 --retry 3 "$HEALTHCHECKS_PING_URL/fail" || true
           fi
