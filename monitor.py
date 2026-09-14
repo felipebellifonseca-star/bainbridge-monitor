@@ -17,6 +17,7 @@ STATE_FILE = Path("state.json")
 KEEPALIVE_DAYS = 30
 HEARTBEAT_MINUTES = 60
 LOCAL_TZ = ZoneInfo("America/New_York")
+TEST_MODE = os.getenv("TEST_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 HEADERS = {
     "User-Agent": (
@@ -40,6 +41,14 @@ UNIT_PATTERN = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def local_time_text() -> str:
+    return datetime.now(LOCAL_TZ).strftime("%I:%M %p").lstrip("0")
 
 
 def fetch_floorplan(plan: str) -> dict:
@@ -95,27 +104,67 @@ def load_state() -> dict:
         return {}
 
 
-def save_state(units: dict, previous_state: dict | None = None, heartbeat_sent: bool = False) -> None:
-    now = datetime.now(timezone.utc)
+def write_state(payload: dict) -> None:
+    STATE_FILE.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def save_success_state(
+    units: dict,
+    previous_state: dict | None = None,
+    notification_sent: bool = False,
+) -> None:
+    now = utc_now()
     previous_state = previous_state or {}
 
     last_heartbeat = previous_state.get("last_heartbeat_utc")
-    if heartbeat_sent:
+    if notification_sent:
         last_heartbeat = now.isoformat()
 
     payload = {
         "updated_at_utc": now.isoformat(),
         "last_success_utc": now.isoformat(),
+        "monitor_status": "ok",
         "max_rent": MAX_RENT,
         "units": dict(sorted(units.items())),
     }
     if last_heartbeat:
         payload["last_heartbeat_utc"] = last_heartbeat
 
-    STATE_FILE.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_state(payload)
+
+
+def record_failure(exc: Exception) -> None:
+    state = load_state()
+    already_in_error = state.get("monitor_status") == "error"
+    error_text = str(exc)[:500]
+
+    # Envia somente o primeiro alerta. Enquanto continuar quebrado, fica silencioso
+    # no Telegram para não gerar uma mensagem a cada 5 minutos.
+    if not already_in_error:
+        try:
+            send_telegram(
+                "⚠️ ERRO NO MONITOR BAINBRIDGE\n\n"
+                "Não consegui concluir a verificação automática.\n"
+                f"Horário: {local_time_text()}\n"
+                f"Erro: {error_text}\n\n"
+                "Não vou repetir este alerta a cada 5 minutos. "
+                "Avisarei quando o monitor voltar ao normal."
+            )
+        except Exception as telegram_exc:
+            print(
+                f"Também não foi possível enviar o alerta no Telegram: {telegram_exc}",
+                file=sys.stderr,
+            )
+
+        payload = dict(state)
+        payload["monitor_status"] = "error"
+        payload["last_error_utc"] = utc_now().isoformat()
+        payload["last_error_message"] = error_text
+        payload["updated_at_utc"] = utc_now().isoformat()
+        write_state(payload)
 
 
 def keepalive_due(state: dict) -> bool:
@@ -126,8 +175,7 @@ def keepalive_due(state: dict) -> bool:
         previous = datetime.fromisoformat(stamp)
         if previous.tzinfo is None:
             previous = previous.replace(tzinfo=timezone.utc)
-        age = datetime.now(timezone.utc) - previous
-        return age.days >= KEEPALIVE_DAYS
+        return (utc_now() - previous).days >= KEEPALIVE_DAYS
     except Exception:
         return True
 
@@ -140,7 +188,7 @@ def heartbeat_due(state: dict) -> bool:
         previous = datetime.fromisoformat(stamp)
         if previous.tzinfo is None:
             previous = previous.replace(tzinfo=timezone.utc)
-        age_seconds = (datetime.now(timezone.utc) - previous).total_seconds()
+        age_seconds = (utc_now() - previous).total_seconds()
         return age_seconds >= HEARTBEAT_MINUTES * 60
     except Exception:
         return True
@@ -159,11 +207,6 @@ def qualifying_counts(units: dict) -> tuple[int, int]:
 
 def money(value: int) -> str:
     return f"${value:,.0f}"
-
-
-def local_time_text() -> str:
-    now = datetime.now(LOCAL_TZ)
-    return now.strftime("%I:%M %p").lstrip("0")
 
 
 def unit_line(unit: dict) -> str:
@@ -194,7 +237,6 @@ def current_summary(units: dict) -> str:
 
 def detect_changes(old_units: dict, new_units: dict) -> list[str]:
     events = []
-
     old_q = qualifying(old_units)
     new_q = qualifying(new_units)
 
@@ -208,10 +250,7 @@ def detect_changes(old_units: dict, new_units: dict) -> list[str]:
                 f"Antes: {money(old['price'])}"
             )
         else:
-            events.append(
-                "🏠 NOVA UNIDADE NO SEU FILTRO\n"
-                f"{unit_line(new)}"
-            )
+            events.append("🏠 NOVA UNIDADE NO SEU FILTRO\n" f"{unit_line(new)}")
 
     for key in sorted(set(old_q) - set(new_q)):
         old = old_q[key]
@@ -224,10 +263,7 @@ def detect_changes(old_units: dict, new_units: dict) -> list[str]:
                 f"Disponibilidade atual: {new['availability']}"
             )
         else:
-            events.append(
-                "❌ NÃO APARECE MAIS COMO DISPONÍVEL\n"
-                f"{unit_line(old)}"
-            )
+            events.append("❌ NÃO APARECE MAIS COMO DISPONÍVEL\n" f"{unit_line(old)}")
 
     for key in sorted(set(old_q) & set(new_q)):
         old = old_q[key]
@@ -277,24 +313,31 @@ def telegram_chat_id(token: str) -> str:
             return str(chat["id"])
 
     raise RuntimeError(
-        "Não encontrei seu chat no Telegram. Abra o bot, toque em Start "
-        "e envie uma mensagem (por exemplo: /start), depois rode novamente."
+        "Não encontrei seu chat no Telegram. Configure TELEGRAM_CHAT_ID nos Secrets "
+        "do GitHub ou envie uma nova mensagem para o bot."
     )
 
 
-def send_telegram(text: str) -> None:
+def send_telegram(text: str, include_chat_id: bool = False) -> str:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise RuntimeError("Secret TELEGRAM_BOT_TOKEN não configurado no GitHub.")
 
     chat_id = telegram_chat_id(token)
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    text_to_send = text
+    if include_chat_id:
+        text_to_send += (
+            "\n\n🔐 Seu Telegram Chat ID é:\n"
+            f"{chat_id}\n\n"
+            "Salve esse número no GitHub como secret TELEGRAM_CHAT_ID."
+        )
 
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     response = requests.post(
         url,
         json={
             "chat_id": chat_id,
-            "text": text,
+            "text": text_to_send,
             "disable_web_page_preview": True,
         },
         timeout=20,
@@ -304,6 +347,8 @@ def send_telegram(text: str) -> None:
     payload = response.json()
     if not payload.get("ok"):
         raise RuntimeError(f"Telegram retornou erro: {payload}")
+
+    return chat_id
 
 
 def heartbeat_message(units: dict) -> str:
@@ -326,6 +371,19 @@ def main() -> None:
     for plan in FLOORPLANS:
         new_units.update(fetch_floorplan(plan))
 
+    # Modo de teste manual: consulta o site e testa o Telegram, mas não mexe no estado.
+    if TEST_MODE:
+        message = (
+            "🧪 TESTE DO MONITOR BAINBRIDGE: OK\n\n"
+            f"Horário: {local_time_text()}\n"
+            "Leitura de B1/B2: OK\n"
+            "Telegram: OK\n\n"
+            + current_summary(new_units)
+        )
+        send_telegram(message, include_chat_id=True)
+        print("Teste concluído com sucesso. Mensagem enviada ao Telegram.")
+        return
+
     if not old_units:
         message = (
             "✅ MONITOR BAINBRIDGE ATIVADO\n\n"
@@ -339,12 +397,24 @@ def main() -> None:
             + f"B2: {BASE_URL}/b2/"
         )
         send_telegram(message)
-        save_state(new_units, old_state, heartbeat_sent=True)
+        save_success_state(new_units, old_state, notification_sent=True)
         print(message)
         return
 
+    was_in_error = old_state.get("monitor_status") == "error"
     events = detect_changes(old_units, new_units)
-    sent_health_message = False
+    notification_sent = False
+
+    if was_in_error:
+        recovery = (
+            "✅ MONITOR BAINBRIDGE VOLTOU AO NORMAL\n\n"
+            f"Horário: {local_time_text()}\n"
+            "A consulta de B1 e B2 foi concluída com sucesso novamente.\n"
+            "O monitor voltou a acompanhar normalmente."
+        )
+        send_telegram(recovery)
+        notification_sent = True
+        print(recovery)
 
     if events:
         message = (
@@ -357,18 +427,27 @@ def main() -> None:
             + f"B2: {BASE_URL}/b2/"
         )
         send_telegram(message)
-        sent_health_message = True
+        notification_sent = True
         print(message)
-    elif heartbeat_due(old_state):
+    elif not was_in_error and heartbeat_due(old_state):
         message = heartbeat_message(new_units)
         send_telegram(message)
-        sent_health_message = True
+        notification_sent = True
         print(message)
-    else:
+    elif not was_in_error:
         print("Sem mudanças relevantes. Heartbeat ainda não venceu.")
 
-    if old_units != new_units or sent_health_message or keepalive_due(old_state):
-        save_state(new_units, old_state, heartbeat_sent=sent_health_message)
+    if (
+        old_units != new_units
+        or notification_sent
+        or was_in_error
+        or keepalive_due(old_state)
+    ):
+        save_success_state(
+            new_units,
+            old_state,
+            notification_sent=notification_sent,
+        )
 
 
 if __name__ == "__main__":
@@ -376,16 +455,5 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         print(f"ERRO: {exc}", file=sys.stderr)
-        try:
-            send_telegram(
-                "⚠️ ERRO NO MONITOR BAINBRIDGE\n\n"
-                "Não consegui concluir a verificação automática.\n"
-                f"Erro: {str(exc)[:500]}\n\n"
-                "O GitHub tentará novamente na próxima execução."
-            )
-        except Exception as telegram_exc:
-            print(
-                f"Também não foi possível enviar o alerta no Telegram: {telegram_exc}",
-                file=sys.stderr,
-            )
+        record_failure(exc)
         raise
