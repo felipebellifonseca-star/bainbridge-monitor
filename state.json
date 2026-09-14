@@ -1,1 +1,159 @@
-{}
+{
+  "max_rent": 2700,
+  "units": {
+    "B1-1119": {
+      "availability": "Nov 09",
+      "floor": 1,
+      "plan": "B1",
+      "price": 2775,
+      "sqft": 1250,
+      "unit": "1119",
+      "url": "https://bainbridgegrand.com/floorplans/b1/"
+    },
+    "B1-1166": {
+      "availability": "Now",
+      "floor": 1,
+      "plan": "B1",
+      "price": 2474,
+      "sqft": 1250,
+      "unit": "1166",
+      "url": "https://bainbridgegrand.com/floorplans/b1/"
+    },
+    "B1-1168": {
+      "availability": "Now",
+      "floor": 1,
+      "plan": "B1",
+      "price": 2700,
+      "sqft": 1250,
+      "unit": "1168",
+      "url": "https://bainbridgegrand.com/floorplans/b1/"
+    },
+    "B1-1192": {
+      "availability": "Now",
+      "floor": 1,
+      "plan": "B1",
+      "price": 2474,
+      "sqft": 1250,
+      "unit": "1192",
+      "url": "https://bainbridgegrand.com/floorplans/b1/"
+    },
+    "B1-4111": {
+      "availability": "Oct 19",
+      "floor": 4,
+      "plan": "B1",
+      "price": 2550,
+      "sqft": 1250,
+      "unit": "4111",
+      "url": "https://bainbridgegrand.com/floorplans/b1/"
+    },
+    "B1-5111": {
+      "availability": "Oct 12",
+      "floor": 5,
+      "plan": "B1",
+      "price": 2785,
+      "sqft": 1250,
+      "unit": "5111",
+      "url": "https://bainbridgegrand.com/floorplans/b1/"
+    },
+    "B2-1180": {
+      "availability": "Now",
+      "floor": 1,
+      "plan": "B2",
+      "price": 2905,
+      "sqft": 1325,
+      "unit": "1180",
+      "url": "https://bainbridgegrand.com/floorplans/b2/"
+    },
+    "B2-2110": {
+      "availability": "Dec 14",
+      "floor": 2,
+      "plan": "B2",
+      "price": 2605,
+      "sqft": 1325,
+      "unit": "2110",
+      "url": "https://bainbridgegrand.com/floorplans/b2/"
+    },
+    "B2-2120": {
+      "availability": "Now",
+      "floor": 2,
+      "plan": "B2",
+      "price": 2755,
+      "sqft": 1325,
+      "unit": "2120",
+      "url": "https://bainbridgegrand.com/floorplans/b2/"
+    },
+    "B2-2150": {
+      "availability": "Sep 18",
+      "floor": 2,
+      "plan": "B2",
+      "price": 2755,
+      "sqft": 1325,
+      "unit": "2150",
+      "url": "https://bainbridgegrand.com/floorplans/b2/"
+    },
+    "B2-2180": {
+      "availability": "Now",
+      "floor": 2,
+      "plan": "B2",
+      "price": 2790,
+      "sqft": 1325,
+      "unit": "2180",
+      "url": "https://bainbridgegrand.com/floorplans/b2/"
+    },
+    "B2-4150": {
+      "availability": "Nov 08",
+      "floor": 4,
+      "plan": "B2",
+      "price": 2830,
+      "sqft": 1325,
+      "unit": "4150",
+      "url": "https://bainbridgegrand.com/floorplans/b2/"
+    },
+    "B2-5110": {
+      "availability": "Now",
+      "floor": 5,
+      "plan": "B2",
+      "price": 2880,
+      "sqft": 1325,
+      "unit": "5110",
+      "url": "https://bainbridgegrand.com/floorplans/b2/"
+    },
+    "B2-5120": {
+      "availability": "Now",
+      "floor": 5,
+      "plan": "B2",
+      "price": 2880,
+      "sqft": 1325,
+      "unit": "5120",
+      "url": "https://bainbridgegrand.com/floorplans/b2/"
+    },
+    "B2-5122": {
+      "availability": "Now",
+      "floor": 5,
+      "plan": "B2",
+      "price": 2880,
+      "sqft": 1325,
+      "unit": "5122",
+      "url": "https://bainbridgegrand.com/floorplans/b2/"
+    },
+    "B2-5128": {
+      "availability": "Now",
+      "floor": 5,
+      "plan": "B2",
+      "price": 2880,
+      "sqft": 1325,
+      "unit": "5128",
+      "url": "https://bainbridgegrand.com/floorplans/b2/"
+    },
+    "B2-5160": {
+      "availability": "Now",
+      "floor": 5,
+      "plan": "B2",
+      "price": 2880,
+      "sqft": 1325,
+      "unit": "5160",
+      "url": "https://bainbridgegrand.com/floorplans/b2/"
+    }
+  },
+  "updated_at_utc": "2026-09-14T22:26:28.220465+00:00"
+}
