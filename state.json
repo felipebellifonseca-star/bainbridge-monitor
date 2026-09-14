@@ -68,7 +68,7 @@
       "availability": "Dec 14",
       "floor": 2,
       "plan": "B2",
-      "price": 2800,
+      "price": 2605,
       "sqft": 1325,
       "unit": "2110",
       "url": "https://bainbridgegrand.com/floorplans/b2/"
@@ -155,5 +155,5 @@
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     }
   },
-  "updated_at_utc": "2026-09-14T22:26:28.220465+00:00"
+  "updated_at_utc": "2026-09-14T22:39:18.879453+00:00"
 }
