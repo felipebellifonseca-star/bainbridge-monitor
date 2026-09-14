@@ -5,6 +5,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -14,6 +15,8 @@ FLOORPLANS = ("B1", "B2")
 MAX_RENT = int(os.getenv("MAX_RENT", "2700"))
 STATE_FILE = Path("state.json")
 KEEPALIVE_DAYS = 30
+HEARTBEAT_MINUTES = 60
+LOCAL_TZ = ZoneInfo("America/New_York")
 
 HEADERS = {
     "User-Agent": (
@@ -92,12 +95,23 @@ def load_state() -> dict:
         return {}
 
 
-def save_state(units: dict) -> None:
+def save_state(units: dict, previous_state: dict | None = None, heartbeat_sent: bool = False) -> None:
+    now = datetime.now(timezone.utc)
+    previous_state = previous_state or {}
+
+    last_heartbeat = previous_state.get("last_heartbeat_utc")
+    if heartbeat_sent:
+        last_heartbeat = now.isoformat()
+
     payload = {
-        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "updated_at_utc": now.isoformat(),
+        "last_success_utc": now.isoformat(),
         "max_rent": MAX_RENT,
         "units": dict(sorted(units.items())),
     }
+    if last_heartbeat:
+        payload["last_heartbeat_utc"] = last_heartbeat
+
     STATE_FILE.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -118,12 +132,38 @@ def keepalive_due(state: dict) -> bool:
         return True
 
 
+def heartbeat_due(state: dict) -> bool:
+    stamp = state.get("last_heartbeat_utc") or state.get("updated_at_utc")
+    if not stamp:
+        return True
+    try:
+        previous = datetime.fromisoformat(stamp)
+        if previous.tzinfo is None:
+            previous = previous.replace(tzinfo=timezone.utc)
+        age_seconds = (datetime.now(timezone.utc) - previous).total_seconds()
+        return age_seconds >= HEARTBEAT_MINUTES * 60
+    except Exception:
+        return True
+
+
 def qualifying(units: dict) -> dict:
     return {key: value for key, value in units.items() if value["price"] <= MAX_RENT}
 
 
+def qualifying_counts(units: dict) -> tuple[int, int]:
+    q = qualifying(units)
+    b1 = sum(1 for unit in q.values() if unit["plan"] == "B1")
+    b2 = sum(1 for unit in q.values() if unit["plan"] == "B2")
+    return b1, b2
+
+
 def money(value: int) -> str:
     return f"${value:,.0f}"
+
+
+def local_time_text() -> str:
+    now = datetime.now(LOCAL_TZ)
+    return now.strftime("%I:%M %p").lstrip("0")
 
 
 def unit_line(unit: dict) -> str:
@@ -158,7 +198,6 @@ def detect_changes(old_units: dict, new_units: dict) -> list[str]:
     old_q = qualifying(old_units)
     new_q = qualifying(new_units)
 
-    # Entrou no filtro: unidade nova ou preço caiu para dentro do limite.
     for key in sorted(set(new_q) - set(old_q)):
         new = new_q[key]
         if key in old_units:
@@ -174,7 +213,6 @@ def detect_changes(old_units: dict, new_units: dict) -> list[str]:
                 f"{unit_line(new)}"
             )
 
-    # Saiu do filtro: ficou acima do limite ou desapareceu do site.
     for key in sorted(set(old_q) - set(new_q)):
         old = old_q[key]
         if key in new_units:
@@ -191,7 +229,6 @@ def detect_changes(old_units: dict, new_units: dict) -> list[str]:
                 f"{unit_line(old)}"
             )
 
-    # Alterações em unidades que continuam dentro do filtro.
     for key in sorted(set(old_q) & set(new_q)):
         old = old_q[key]
         new = new_q[key]
@@ -223,8 +260,6 @@ def telegram_chat_id(token: str) -> str:
     if explicit:
         return explicit
 
-    # Modo simples: se TELEGRAM_CHAT_ID não estiver configurado,
-    # pega o chat privado mais recente que mandou mensagem para o bot.
     url = f"https://api.telegram.org/bot{token}/getUpdates"
     response = requests.get(url, timeout=20)
     response.raise_for_status()
@@ -250,9 +285,7 @@ def telegram_chat_id(token: str) -> str:
 def send_telegram(text: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        raise RuntimeError(
-            "Secret TELEGRAM_BOT_TOKEN não configurado no GitHub."
-        )
+        raise RuntimeError("Secret TELEGRAM_BOT_TOKEN não configurado no GitHub.")
 
     chat_id = telegram_chat_id(token)
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -273,6 +306,18 @@ def send_telegram(text: str) -> None:
         raise RuntimeError(f"Telegram retornou erro: {payload}")
 
 
+def heartbeat_message(units: dict) -> str:
+    b1, b2 = qualifying_counts(units)
+    return (
+        "✅ MONITOR BAINBRIDGE ATIVO\n\n"
+        f"Horário: {local_time_text()}\n"
+        "Nenhuma mudança relevante desde o último alerta.\n"
+        f"B1 até {money(MAX_RENT)}: {b1} unidade(s)\n"
+        f"B2 até {money(MAX_RENT)}: {b2} unidade(s)\n"
+        "Última consulta: OK"
+    )
+
+
 def main() -> None:
     old_state = load_state()
     old_units = old_state.get("units", {})
@@ -281,24 +326,25 @@ def main() -> None:
     for plan in FLOORPLANS:
         new_units.update(fetch_floorplan(plan))
 
-    # Segurança: só substitui o estado depois que B1 e B2 foram lidos com sucesso.
     if not old_units:
         message = (
             "✅ MONITOR BAINBRIDGE ATIVADO\n\n"
             "Plantas: B1 e B2\n"
             f"Preço máximo: {money(MAX_RENT)}\n"
-            "Verificação: a cada 5 minutos\n\n"
+            "Verificação: aproximadamente a cada 5 minutos\n"
+            "Confirmação de funcionamento: aproximadamente a cada 1 hora\n\n"
             + current_summary(new_units)
             + "\n\n"
             + f"B1: {BASE_URL}/b1/\n"
             + f"B2: {BASE_URL}/b2/"
         )
         send_telegram(message)
-        save_state(new_units)
+        save_state(new_units, old_state, heartbeat_sent=True)
         print(message)
         return
 
     events = detect_changes(old_units, new_units)
+    sent_health_message = False
 
     if events:
         message = (
@@ -311,14 +357,18 @@ def main() -> None:
             + f"B2: {BASE_URL}/b2/"
         )
         send_telegram(message)
+        sent_health_message = True
+        print(message)
+    elif heartbeat_due(old_state):
+        message = heartbeat_message(new_units)
+        send_telegram(message)
+        sent_health_message = True
         print(message)
     else:
-        print("Sem mudanças relevantes.")
+        print("Sem mudanças relevantes. Heartbeat ainda não venceu.")
 
-    # Guarda também unidades acima do limite, para perceber quando caírem para <= MAX_RENT.
-    # Só altera o arquivo quando os dados mudarem ou a cada 30 dias como keepalive do repo.
-    if old_units != new_units or keepalive_due(old_state):
-        save_state(new_units)
+    if old_units != new_units or sent_health_message or keepalive_due(old_state):
+        save_state(new_units, old_state, heartbeat_sent=sent_health_message)
 
 
 if __name__ == "__main__":
@@ -326,4 +376,16 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         print(f"ERRO: {exc}", file=sys.stderr)
+        try:
+            send_telegram(
+                "⚠️ ERRO NO MONITOR BAINBRIDGE\n\n"
+                "Não consegui concluir a verificação automática.\n"
+                f"Erro: {str(exc)[:500]}\n\n"
+                "O GitHub tentará novamente na próxima execução."
+            )
+        except Exception as telegram_exc:
+            print(
+                f"Também não foi possível enviar o alerta no Telegram: {telegram_exc}",
+                file=sys.stderr,
+            )
         raise
