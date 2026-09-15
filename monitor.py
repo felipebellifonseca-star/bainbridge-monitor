@@ -13,6 +13,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 
 BASE_URL = "https://bainbridgegrand.com/floorplans"
@@ -99,8 +100,27 @@ def parse_floorplan_text(plan, text):
 _DRIVER = None
 
 
+def clean_error(exc):
+    """Deixa os erros do Chrome curtos e úteis para o Telegram."""
+    text = str(exc or "").strip()
+    if not text:
+        return exc.__class__.__name__
+
+    first_line = text.splitlines()[0].strip()
+    if not first_line:
+        first_line = exc.__class__.__name__
+
+    # Remove pilhas gigantes do Chrome; o log do GitHub continua tendo detalhes.
+    return first_line[:350]
+
+
 def get_browser():
-    """Abre um Chrome real em modo headless e o reutiliza para B1 e B2."""
+    """
+    Abre Chrome headless de forma mais tolerante.
+
+    page_load_strategy='eager' é importante aqui: não esperamos imagens,
+    trackers e outros recursos terminarem para considerar a navegação pronta.
+    """
     global _DRIVER
     if _DRIVER is not None:
         return _DRIVER
@@ -114,6 +134,8 @@ def get_browser():
     chromedriver = shutil.which("chromedriver")
 
     options = Options()
+    options.page_load_strategy = "eager"
+
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
@@ -125,10 +147,22 @@ def get_browser():
     options.add_argument("--disable-sync")
     options.add_argument("--no-first-run")
     options.add_argument("--incognito")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-backgrounding-occluded-windows")
     options.add_argument(
-        "--user-agent=Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/151.0.0.0 Safari/537.36"
+        "--disable-features=Translate,BackForwardCache,MediaRouter,"
+        "OptimizationHints,AutofillServerCommunication"
+    )
+
+    # Imagens são irrelevantes para o monitor e só deixam a página mais pesada.
+    options.add_experimental_option(
+        "prefs",
+        {
+            "profile.managed_default_content_settings.images": 2,
+            "profile.default_content_setting_values.notifications": 2,
+            "profile.default_content_setting_values.popups": 0,
+        },
     )
 
     if chrome_binary:
@@ -141,21 +175,42 @@ def get_browser():
                 options=options,
             )
         else:
-            # Selenium Manager tenta resolver o driver compatível.
             driver = webdriver.Chrome(options=options)
     except Exception as exc:
         raise RuntimeError(
             "Não consegui iniciar o Chrome do GitHub Actions. "
-            f"Erro: {exc}"
+            f"Erro: {clean_error(exc)}"
         ) from exc
 
-    driver.set_page_load_timeout(45)
-    driver.set_script_timeout(20)
+    # Timeout curto: se os recursos secundários travarem, ainda tentamos ler
+    # o DOM que já foi carregado em vez de esperar quase um minuto.
+    driver.set_page_load_timeout(22)
+    driver.set_script_timeout(15)
 
     try:
         driver.execute_cdp_cmd("Network.enable", {})
-        driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
+        driver.execute_cdp_cmd(
+            "Network.setCacheDisabled",
+            {"cacheDisabled": True},
+        )
         driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+        driver.execute_cdp_cmd(
+            "Network.setBlockedURLs",
+            {
+                "urls": [
+                    "*.png",
+                    "*.jpg",
+                    "*.jpeg",
+                    "*.gif",
+                    "*.webp",
+                    "*.avif",
+                    "*.mp4",
+                    "*.webm",
+                    "*.woff",
+                    "*.woff2",
+                ]
+            },
+        )
     except Exception:
         pass
 
@@ -175,8 +230,11 @@ def close_browser():
 
 def rendered_body_text(driver, url, plan):
     """
-    Abre a página como um usuário de verdade, espera JavaScript terminar e
-    devolve somente o texto VISÍVEL. Elementos ocultados pelo site não entram.
+    Lê o texto VISÍVEL do site depois do JavaScript.
+
+    Não exigimos document.readyState='complete', porque analytics, imagens ou
+    widgets externos podem segurar o evento load e causar timeout do renderer
+    mesmo quando a disponibilidade já está visível na tela.
     """
     separator = "&" if "?" in url else "?"
     fresh_url = f"{url}{separator}_monitor_ts={int(time.time() * 1000)}"
@@ -186,58 +244,104 @@ def rendered_body_text(driver, url, plan):
     except Exception:
         pass
 
-    driver.get(fresh_url)
+    try:
+        driver.get(fresh_url)
+    except TimeoutException as exc:
+        # O Chrome pode estourar o timeout esperando recursos secundários.
+        # Se o DOM já existe, paramos o restante do carregamento e continuamos.
+        print(
+            f"{plan}: navegação atingiu timeout, vou tentar usar o DOM já carregado: "
+            f"{clean_error(exc)}"
+        )
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
 
-    WebDriverWait(driver, 20).until(
-        lambda d: d.execute_script("return document.readyState") == "complete"
+    # Precisamos apenas do body, não de todos os recursos da página.
+    WebDriverWait(driver, 10).until(
+        lambda d: len(d.find_elements(By.TAG_NAME, "body")) > 0
     )
 
-    # Alguns componentes de disponibilidade carregam depois do evento load.
-    # Rolamos a página para disparar widgets lazy-load e esperamos o texto estabilizar.
-    try:
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    except Exception:
-        pass
-    time.sleep(2)
-
-    previous = None
-    stable_rounds = 0
     best_text = ""
+    previous_units = None
+    stable_unit_rounds = 0
+    shell_stable_rounds = 0
+    previous_text = None
 
-    for _ in range(8):
+    # Dá tempo para o componente de disponibilidade buscar os dados via JS.
+    for round_no in range(18):
+        try:
+            if round_no in {1, 4, 8}:
+                driver.execute_script(
+                    "window.scrollTo(0, document.body.scrollHeight);"
+                )
+            elif round_no in {3, 7}:
+                driver.execute_script("window.scrollTo(0, 0);")
+        except Exception:
+            pass
+
         body = driver.find_element(By.TAG_NAME, "body")
         current = body.text or ""
+
         if len(current) > len(best_text):
             best_text = current
 
-        if current == previous and len(current) > 500:
-            stable_rounds += 1
-        else:
-            stable_rounds = 0
+        units = parse_floorplan_text(plan, current)
+        unit_keys = tuple(sorted(units))
 
-        if stable_rounds >= 2:
-            best_text = current
-            break
+        # Se as unidades visíveis ficam iguais em 2 leituras consecutivas,
+        # depois de alguns segundos de carregamento, consideramos o DOM estável.
+        if units:
+            if unit_keys == previous_units:
+                stable_unit_rounds += 1
+            else:
+                stable_unit_rounds = 0
 
-        previous = current
-        time.sleep(1.5)
+            previous_units = unit_keys
 
-    if len(best_text) < 500:
-        raise RuntimeError(
-            f"A página {plan} abriu, mas o conteúdo visível parece incompleto."
+            if round_no >= 3 and stable_unit_rounds >= 2:
+                return current
+
+        # Caso realmente existam zero unidades, validamos o shell da página
+        # antes de aceitar o resultado vazio.
+        normalized = " ".join(current.split()).lower()
+        shell_loaded = (
+            plan.lower() in normalized
+            and "floorplans are artist" in normalized
         )
 
-    return best_text
+        if not units and shell_loaded:
+            if current == previous_text:
+                shell_stable_rounds += 1
+            else:
+                shell_stable_rounds = 0
+
+            # Esperamos mais tempo para não confundir "ainda carregando"
+            # com "nenhuma unidade disponível".
+            if round_no >= 8 and shell_stable_rounds >= 2:
+                return current
+
+        previous_text = current
+        time.sleep(1)
+
+    # Mesmo sem estabilizar formalmente, se vimos unidades válidas durante a
+    # espera, usamos a melhor versão visível encontrada.
+    if parse_floorplan_text(plan, best_text):
+        return best_text
+
+    raise RuntimeError(
+        f"A página {plan} abriu, mas a disponibilidade não terminou de carregar."
+    )
 
 
 def fetch_floorplan(plan):
     """
-    Fonte principal: DOM VISÍVEL de um Chrome real, depois do JavaScript.
+    Fonte principal: texto VISÍVEL de um Chrome real.
 
-    Isso é proposital: o HTML cru do Bainbridge pode continuar contendo uma
-    unidade antiga mesmo depois de a interface real já ter removido a unidade.
+    Cada falha reinicia totalmente o navegador. Isso evita reutilizar um
+    renderer travado, que foi a causa dos timeouts observados no GitHub.
     """
-    driver = get_browser()
     slug = plan.lower()
     urls = [
         f"https://bainbridgegrand.com/floorplans/{slug}/",
@@ -248,11 +352,17 @@ def fetch_floorplan(plan):
 
     for n, url in enumerate(urls, start=1):
         try:
-            print(f"Consultando {plan} no Chrome: tentativa {n}/{len(urls)}")
+            # Se a tentativa anterior travou, esta começa com processo novo.
+            driver = get_browser()
+
+            print(
+                f"Consultando {plan} no Chrome: "
+                f"tentativa {n}/{len(urls)}"
+            )
+
             text = rendered_body_text(driver, url, plan)
             units = parse_floorplan_text(plan, text)
 
-            # Se houver cards de unidades, usamos somente os cards VISÍVEIS.
             if units:
                 print(
                     f"{plan}: Chrome OK ({len(units)} unidades visíveis): "
@@ -260,15 +370,15 @@ def fetch_floorplan(plan):
                 )
                 return units
 
-            # Zero unidades pode ser legítimo, mas só aceitamos isso quando a
-            # própria página terminou de carregar e mostra o shell do floorplan.
             normalized = " ".join(text.split()).lower()
-            loaded_markers = [
-                plan.lower(),
-                "floorplans are artist",
-            ]
-            if all(marker in normalized for marker in loaded_markers):
-                print(f"{plan}: Chrome OK, nenhuma unidade visível disponível.")
+            if (
+                plan.lower() in normalized
+                and "floorplans are artist" in normalized
+            ):
+                print(
+                    f"{plan}: Chrome OK, "
+                    "nenhuma unidade visível disponível."
+                )
                 return {}
 
             raise RuntimeError(
@@ -276,13 +386,23 @@ def fetch_floorplan(plan):
             )
 
         except Exception as exc:
-            errors.append(str(exc))
-            print(f"{plan}: Chrome tentativa {n} falhou: {exc}", file=sys.stderr)
+            short = clean_error(exc)
+            errors.append(short)
+
+            print(
+                f"{plan}: Chrome tentativa {n} falhou: {exc}",
+                file=sys.stderr,
+            )
+
+            # Muito importante: um renderer que entrou em timeout pode continuar
+            # quebrado. Matamos o Chrome e criamos outro na próxima tentativa.
+            close_browser()
             time.sleep(2)
 
     raise RuntimeError(
-        f"Falha ao consultar {plan} com o navegador real após {len(urls)} tentativas. "
-        f"Últimos erros: {' | '.join(errors[-2:])}"
+        f"Falha ao consultar {plan} com o navegador real após "
+        f"{len(urls)} tentativas. "
+        f"Erros: {' | '.join(errors[-2:])}"
     )
 
 
@@ -573,7 +693,7 @@ def save_success_state(units, previous_state):
 def record_failure(exc):
     state = load_state()
     already_in_error = state.get("monitor_status") == "error"
-    error_text = str(exc)[:900]
+    error_text = clean_error(exc)
 
     # As tentativas já aconteceram dentro de fetch_floorplan().
     # Portanto uma falha final já merece um alerta.
