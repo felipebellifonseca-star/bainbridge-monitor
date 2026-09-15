@@ -1,10 +1,8 @@
 {
-  "last_error_message": "Falha ao consultar B1 com o navegador real após 2 tentativas. Últimos erros: A página B1 abriu, mas o conteúdo visível parece incompleto. | A página B1 abriu, mas o conteúdo visível parece incompleto.",
-  "last_error_utc": "2026-09-15T15:15:21.625331+00:00",
-  "last_success_utc": "2026-09-15T14:54:33.876447+00:00",
+  "last_success_utc": "2026-09-15T15:27:07.629314+00:00",
   "max_rent": 2700,
-  "monitor_status": "error",
-  "telegram_update_id": 879278901,
+  "monitor_status": "ok",
+  "telegram_update_id": 879278903,
   "units": {
     "B1-1119": {
       "availability": "Nov 09",
@@ -160,5 +158,5 @@
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     }
   },
-  "updated_at_utc": "2026-09-15T15:15:21.625349+00:00"
+  "updated_at_utc": "2026-09-15T15:27:07.629314+00:00"
 }
