@@ -48,9 +48,9 @@ UNIT_PATTERN = re.compile(
 )
 
 A_CARD_PATTERN = re.compile(
-    r"(?:View\s+Floorplan\s+)?(?P<plan>A[1-6])\s+"
-    r"1\s*bed\s+1\s*bath\s+"
-    r"(?P<sqft>[\d,]+)\s+sq\.?\s*ft\.?\s+"
+    r"(?:View\s+Floorplan\s+)?(?P<plan>A[1-6])\s*"
+    r"1\s*bed\s*1\s*bath\s*"
+    r"(?P<sqft>[\d,]+)\s*sq\.?\s*ft\.?\s*"
     r"(?:(?:Starting\s+at\s+\$(?P<price>[\d,]+))|Contact\s+Us)",
     re.IGNORECASE,
 )
@@ -459,6 +459,16 @@ def fetch_a_index_cards():
     stable_rounds = 0
 
     for round_no in range(12):
+        try:
+            if round_no in {1, 3, 5, 8}:
+                driver.execute_script(
+                    "window.scrollTo(0, document.body.scrollHeight);"
+                )
+            elif round_no in {2, 6}:
+                driver.execute_script("window.scrollTo(0, 0);")
+        except Exception:
+            pass
+
         body_text = driver.find_element(By.TAG_NAME, "body").text or ""
         cards = parse_a_cards(body_text)
 
@@ -913,7 +923,74 @@ def save_success_state(units, previous_state):
     if previous_state.get("manual_pending"):
         payload["manual_pending"] = True
 
+    # Saúde do filtro A1-A6 é independente do monitor principal B1/B2.
+    payload["a_consecutive_failures"] = int(
+        previous_state.get("a_consecutive_failures", 0) or 0
+    )
+    payload["a_error_notified"] = bool(
+        previous_state.get("a_error_notified", False)
+    )
+    if previous_state.get("a_last_error_message"):
+        payload["a_last_error_message"] = previous_state["a_last_error_message"]
+    if previous_state.get("a_last_error_utc"):
+        payload["a_last_error_utc"] = previous_state["a_last_error_utc"]
+
     write_state(payload)
+
+
+def update_a_health(state, error=None):
+    """
+    O filtro A1-A6 não derruba o monitor principal B1/B2.
+
+    Se A falhar, preservamos o último estado conhecido. Só depois de duas
+    execuções consecutivas avisamos que o filtro de 1 quarto está degradado.
+    """
+    updated = dict(state)
+
+    if error is None:
+        was_notified = bool(updated.get("a_error_notified", False))
+        had_failures = int(updated.get("a_consecutive_failures", 0) or 0) > 0
+
+        updated["a_consecutive_failures"] = 0
+        updated["a_error_notified"] = False
+        updated.pop("a_last_error_message", None)
+        updated.pop("a_last_error_utc", None)
+
+        if was_notified:
+            send_telegram(
+                "✅ FILTRO DE 1 QUARTO VOLTOU AO NORMAL\n\n"
+                f"Horário: {local_time_text()}\n"
+                "A1-A6 voltaram a ser consultados normalmente. "
+                "O monitor B1/B2 permaneceu funcionando durante o problema."
+            )
+        elif had_failures:
+            print("Falha isolada do filtro A1-A6 resolvida silenciosamente.")
+
+        return updated
+
+    count = int(updated.get("a_consecutive_failures", 0) or 0) + 1
+    updated["a_consecutive_failures"] = count
+    updated["a_last_error_message"] = clean_error(error)
+    updated["a_last_error_utc"] = utc_now().isoformat()
+
+    already_notified = bool(updated.get("a_error_notified", False))
+
+    if count >= ERROR_FAILURE_THRESHOLD and not already_notified:
+        send_telegram(
+            "⚠️ FILTRO DE 1 QUARTO TEMPORARIAMENTE INDISPONÍVEL\n\n"
+            f"Horário: {local_time_text()}\n"
+            "Não consegui atualizar A1-A6 em 2 execuções consecutivas.\n"
+            "O monitor de B1/B2 continua funcionando normalmente.\n\n"
+            "Vou continuar tentando e aviso quando A1-A6 voltarem."
+        )
+        updated["a_error_notified"] = True
+    elif count < ERROR_FAILURE_THRESHOLD:
+        print(
+            "Falha isolada no filtro A1-A6. "
+            "B1/B2 continuam ativos e nenhum alerta foi enviado."
+        )
+
+    return updated
 
 
 def record_failure(exc):
@@ -1026,9 +1103,26 @@ def main():
     for plan in FLOORPLANS:
         new_units.update(fetch_floorplan(plan))
 
-    # 1 quarto: primeiro consulta a página geral e só abre A1-A6
-    # individualmente quando realmente houver chance de preço < $1.800.
-    new_units.update(fetch_a_monitor_units(old_units))
+    # 1 quarto: o filtro A1-A6 tem saúde independente. Se ele falhar,
+    # B1/B2 continuam sendo monitorados e preservamos o último estado A.
+    a_error = None
+    try:
+        new_units.update(fetch_a_monitor_units(old_units))
+        old_state = update_a_health(old_state, error=None)
+    except Exception as exc:
+        a_error = exc
+        print(f"Filtro A1-A6 falhou: {exc}", file=sys.stderr)
+
+        # Não gere falso alerta de desaparecimento durante uma falha de leitura.
+        for key, unit in old_units.items():
+            if unit.get("plan") in A_PLANS:
+                new_units[key] = unit
+
+        old_state = update_a_health(old_state, error=exc)
+
+    # Persiste a saúde do filtro A mesmo quando não houve mudança de unidade.
+    old_state["updated_at_utc"] = utc_now().isoformat()
+    write_state(old_state)
 
     if not old_units:
         message = (
@@ -1058,11 +1152,18 @@ def main():
         print(recovery)
 
     if manual_request:
+        a_note = (
+            "\n\n⚠️ A1-A6 não puderam ser atualizados nesta consulta; "
+            "o bloco de 1 quarto mostra o último estado conhecido."
+            if a_error is not None
+            else ""
+        )
         message = (
             "🔎 CONSULTA MANUAL BAINBRIDGE\n\n"
             f"Horário: {local_time_text()}\n"
-            "Consulta concluída com sucesso.\n\n"
+            "Consulta concluída.\n\n"
             + current_summary(new_units)
+            + a_note
         )
         send_telegram(message)
         print(message)
@@ -1076,6 +1177,12 @@ def main():
             + format_event_sections(events)
             + "\n\n📋 SITUAÇÃO ATUAL\n\n"
             + current_summary(new_units)
+            + (
+                "\n\n⚠️ A1-A6 não puderam ser atualizados nesta execução; "
+                "o bloco de 1 quarto mantém o último estado conhecido."
+                if a_error is not None
+                else ""
+            )
         )
         send_telegram(message)
         print(message)
