@@ -1,5 +1,5 @@
 {
-  "last_success_utc": "2026-09-15T16:18:45.410991+00:00",
+  "last_success_utc": "2026-09-15T17:48:41.002538+00:00",
   "max_rent": 2700,
   "monitor_status": "ok",
   "telegram_update_id": 879278903,
@@ -103,6 +103,15 @@
       "unit": "2214",
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     },
+    "B2-4120": {
+      "availability": "Nov 30",
+      "floor": 4,
+      "plan": "B2",
+      "price": 2645,
+      "sqft": 1325,
+      "unit": "4120",
+      "url": "https://bainbridgegrand.com/floorplans/b2/"
+    },
     "B2-4150": {
       "availability": "Nov 08",
       "floor": 4,
@@ -158,5 +167,5 @@
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     }
   },
-  "updated_at_utc": "2026-09-15T16:18:45.410991+00:00"
+  "updated_at_utc": "2026-09-15T17:48:41.002538+00:00"
 }
