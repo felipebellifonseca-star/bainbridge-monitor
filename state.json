@@ -1,7 +1,9 @@
 {
+  "last_error_message": "Falha ao consultar B1 com o navegador real após 2 tentativas. Erros: A página B1 abriu, mas a disponibilidade não terminou de carregar. | A página B1 abriu, mas a disponibilidade não terminou de carregar.",
+  "last_error_utc": "2026-09-15T21:16:17.851702+00:00",
   "last_success_utc": "2026-09-15T20:48:33.160692+00:00",
   "max_rent": 2700,
-  "monitor_status": "ok",
+  "monitor_status": "error",
   "telegram_update_id": 879278903,
   "units": {
     "B1-1119": {
@@ -167,5 +169,5 @@
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     }
   },
-  "updated_at_utc": "2026-09-15T20:48:33.160692+00:00"
+  "updated_at_utc": "2026-09-15T21:16:17.851721+00:00"
 }
