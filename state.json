@@ -1,11 +1,10 @@
 {
-  "last_error_message": "HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out. (read timeout=20)",
-  "last_error_utc": "2026-09-15T01:13:50.056415+00:00",
-  "last_heartbeat_utc": "2026-09-15T00:36:38.350296+00:00",
-  "last_success_utc": "2026-09-15T01:00:30.084114+00:00",
+  "failure_count": 0,
+  "last_heartbeat_utc": "2026-09-15T01:28:37.432417+00:00",
+  "last_success_utc": "2026-09-15T01:28:37.432417+00:00",
   "max_rent": 2700,
-  "monitor_status": "error",
-  "telegram_update_id": 879278897,
+  "monitor_status": "ok",
+  "telegram_update_id": 879278898,
   "units": {
     "B1-1119": {
       "availability": "Nov 09",
@@ -161,5 +160,5 @@
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     }
   },
-  "updated_at_utc": "2026-09-15T01:13:50.056432+00:00"
+  "updated_at_utc": "2026-09-15T01:28:37.432417+00:00"
 }
