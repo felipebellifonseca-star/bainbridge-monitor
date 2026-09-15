@@ -1,11 +1,9 @@
 {
-  "failure_count": 2,
-  "last_error_message": "Falha ao consultar B1: HTTPSConnectionPool(host='bainbridgegrand.com', port=443): Max retries exceeded with url: /floorplans/b1/ (Caused by ConnectTimeoutError(<HTTPSConnection(host='bainbridgegrand.com', port=443) at 0x7faf8eddc8f0>, 'Connection to bainbridgegrand.com timed out. (connect timeout=25)'))",
-  "last_error_utc": "2026-09-15T09:59:48.950384+00:00",
-  "last_heartbeat_utc": "2026-09-15T08:34:15.997239+00:00",
-  "last_success_utc": "2026-09-15T09:32:48.984640+00:00",
+  "failure_count": 0,
+  "last_heartbeat_utc": "2026-09-15T10:09:46.662410+00:00",
+  "last_success_utc": "2026-09-15T10:09:46.662410+00:00",
   "max_rent": 2700,
-  "monitor_status": "error",
+  "monitor_status": "ok",
   "telegram_update_id": 879278898,
   "units": {
     "B1-1119": {
@@ -162,5 +160,5 @@
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     }
   },
-  "updated_at_utc": "2026-09-15T09:59:48.950405+00:00"
+  "updated_at_utc": "2026-09-15T10:09:46.662410+00:00"
 }
