@@ -22,6 +22,7 @@ MAX_RENT = int(os.getenv("MAX_RENT", "2700"))
 STATE_FILE = Path("state.json")
 LOCAL_TZ = ZoneInfo("America/New_York")
 TEST_MODE = os.getenv("TEST_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+ERROR_FAILURE_THRESHOLD = 2
 
 HEADERS = {
     "User-Agent": (
@@ -339,71 +340,57 @@ def fetch_floorplan(plan):
     """
     Fonte principal: texto VISÍVEL de um Chrome real.
 
-    Cada falha reinicia totalmente o navegador. Isso evita reutilizar um
-    renderer travado, que foi a causa dos timeouts observados no GitHub.
+    Fazemos UMA tentativa por execução do GitHub. Se ela falhar, a próxima
+    execução usa uma VM/região/IP novos. Na prática isso é mais útil do que
+    repetir duas vezes dentro do mesmo runner que já está com a rota ruim.
     """
     slug = plan.lower()
-    urls = [
-        f"https://bainbridgegrand.com/floorplans/{slug}/",
-        f"https://www.bainbridgegrand.com/floorplans/{slug}/",
-    ]
+    url = f"https://bainbridgegrand.com/floorplans/{slug}/"
 
-    errors = []
+    try:
+        driver = get_browser()
 
-    for n, url in enumerate(urls, start=1):
-        try:
-            # Se a tentativa anterior travou, esta começa com processo novo.
-            driver = get_browser()
+        print(f"Consultando {plan} no Chrome: tentativa única desta execução")
 
+        text = rendered_body_text(driver, url, plan)
+        units = parse_floorplan_text(plan, text)
+
+        if units:
             print(
-                f"Consultando {plan} no Chrome: "
-                f"tentativa {n}/{len(urls)}"
+                f"{plan}: Chrome OK ({len(units)} unidades visíveis): "
+                + ", ".join(sorted(units))
             )
+            return units
 
-            text = rendered_body_text(driver, url, plan)
-            units = parse_floorplan_text(plan, text)
-
-            if units:
-                print(
-                    f"{plan}: Chrome OK ({len(units)} unidades visíveis): "
-                    + ", ".join(sorted(units))
-                )
-                return units
-
-            normalized = " ".join(text.split()).lower()
-            if (
-                plan.lower() in normalized
-                and "floorplans are artist" in normalized
-            ):
-                print(
-                    f"{plan}: Chrome OK, "
-                    "nenhuma unidade visível disponível."
-                )
-                return {}
-
-            raise RuntimeError(
-                f"Chrome abriu {plan}, mas não consegui validar o conteúdo final."
-            )
-
-        except Exception as exc:
-            short = clean_error(exc)
-            errors.append(short)
-
+        normalized = " ".join(text.split()).lower()
+        if (
+            plan.lower() in normalized
+            and "floorplans are artist" in normalized
+        ):
             print(
-                f"{plan}: Chrome tentativa {n} falhou: {exc}",
-                file=sys.stderr,
+                f"{plan}: Chrome OK, "
+                "nenhuma unidade visível disponível."
             )
+            return {}
 
-            # Muito importante: um renderer que entrou em timeout pode continuar
-            # quebrado. Matamos o Chrome e criamos outro na próxima tentativa.
-            close_browser()
-            time.sleep(2)
+        raise RuntimeError(
+            f"Chrome abriu {plan}, mas não consegui validar o conteúdo final."
+        )
 
-    raise RuntimeError(
-        f"Falha ao consultar {plan} com o navegador real após "
-        f"{len(urls)} tentativas. "
-        f"Erros: {' | '.join(errors[-2:])}"
-    )
+    except Exception as exc:
+        short = clean_error(exc)
+
+        print(
+            f"{plan}: tentativa desta execução falhou: {exc}",
+            file=sys.stderr,
+        )
+
+        # Não reaproveitamos um renderer que tenha travado.
+        close_browser()
+
+        raise RuntimeError(
+            f"Falha ao consultar {plan} nesta execução: {short}"
+        ) from exc
 
 
 def qualifying(units):
@@ -674,49 +661,108 @@ def save_telegram_offset(state, newest_update_id, manual_requested=False):
 
     return updated
 
+def legacy_error_was_notified(state):
+    """
+    Compatibilidade com o state.json antigo: antes não existia error_notified,
+    mas monitor_status='error' significava que o Telegram já tinha sido avisado.
+    """
+    if "error_notified" in state:
+        return bool(state.get("error_notified"))
+    return state.get("monitor_status") == "error"
+
+
 def save_success_state(units, previous_state):
     now = utc_now().isoformat()
     payload = {
         "updated_at_utc": now,
         "last_success_utc": now,
         "monitor_status": "ok",
+        "consecutive_failures": 0,
+        "error_notified": False,
         "max_rent": MAX_RENT,
         "units": dict(sorted(units.items())),
     }
+
     if previous_state.get("telegram_update_id") is not None:
         payload["telegram_update_id"] = previous_state["telegram_update_id"]
+
     if previous_state.get("manual_pending"):
         payload["manual_pending"] = True
+
     write_state(payload)
 
 
 def record_failure(exc):
+    """
+    Uma falha isolada NÃO vira alerta.
+
+    Só avisamos no Telegram quando DUAS execuções diferentes do GitHub falham
+    seguidas. Isso força uma confirmação em outra VM/região/IP antes de dizer
+    que o monitor realmente está com problema.
+    """
     state = load_state()
-    already_in_error = state.get("monitor_status") == "error"
     error_text = clean_error(exc)
 
-    # As tentativas já aconteceram dentro de fetch_floorplan().
-    # Portanto uma falha final já merece um alerta.
-    if not already_in_error:
-        try:
-            send_telegram(
-                "⚠️ ERRO NO MONITOR BAINBRIDGE\n\n"
-                "Tentei várias vezes nesta mesma execução e não consegui concluir a consulta.\n"
-                f"Horário: {local_time_text()}\n"
-                f"Erro: {error_text}\n\n"
-                "Não vou repetir este alerta enquanto o problema continuar. "
-                "Avisarei quando o monitor voltar ao normal."
-            )
-        except Exception as telegram_exc:
-            print(f"Também não consegui enviar o alerta: {telegram_exc}", file=sys.stderr)
+    old_status = state.get("monitor_status")
+    legacy_notified = legacy_error_was_notified(state)
 
+    try:
+        previous_count = int(state.get("consecutive_failures", 0) or 0)
+    except Exception:
+        previous_count = 0
+
+    # Migração do estado antigo: se ele já estava marcado como erro e o usuário
+    # já recebeu alerta, não enviamos outro alerta só porque trocou o código.
+    if legacy_notified and previous_count == 0:
+        previous_count = ERROR_FAILURE_THRESHOLD
+
+    failure_count = previous_count + 1
+
+    state["consecutive_failures"] = failure_count
+    state["last_error_utc"] = utc_now().isoformat()
+    state["last_error_message"] = error_text
+    state["updated_at_utc"] = utc_now().isoformat()
+
+    already_notified = bool(state.get("error_notified", legacy_notified))
+
+    if failure_count >= ERROR_FAILURE_THRESHOLD:
         state["monitor_status"] = "error"
-        state["last_error_utc"] = utc_now().isoformat()
-        state["last_error_message"] = error_text
-        state["updated_at_utc"] = utc_now().isoformat()
-        write_state(state)
+
+        if not already_notified:
+            last_success = state.get("last_success_utc", "desconhecida")
+
+            try:
+                send_telegram(
+                    "⚠️ MONITOR BAINBRIDGE COM PROBLEMA\n\n"
+                    "A disponibilidade não pôde ser lida em "
+                    f"{failure_count} execuções consecutivas do GitHub.\n"
+                    f"Horário: {local_time_text()}\n"
+                    f"Última leitura bem-sucedida: {last_success}\n\n"
+                    "Vou continuar tentando automaticamente. "
+                    "Não repetirei este alerta até o monitor voltar ao normal."
+                )
+                state["error_notified"] = True
+            except Exception as telegram_exc:
+                print(
+                    f"Também não consegui enviar o alerta: {telegram_exc}",
+                    file=sys.stderr,
+                )
+        else:
+            state["error_notified"] = True
+            print(
+                f"Falha consecutiva #{failure_count}; "
+                "o usuário já foi avisado, então não repeti a notificação."
+            )
+
     else:
-        print("Monitor já está em erro; alerta repetido suprimido.")
+        state["monitor_status"] = "degraded"
+        state["error_notified"] = False
+        print(
+            "Falha isolada nesta execução. "
+            "Nenhum alerta enviado; vou confirmar no próximo GitHub runner."
+        )
+
+    write_state(state)
 
 
 def main():
@@ -769,10 +815,11 @@ def main():
         print(message)
         return
 
-    was_in_error = old_state.get("monitor_status") == "error"
+    was_error_notified = legacy_error_was_notified(old_state)
+    had_failed_check = old_state.get("monitor_status") in {"degraded", "error"}
     events = detect_changes(old_units, new_units)
 
-    if was_in_error:
+    if was_error_notified:
         recovery = (
             "✅ MONITOR BAINBRIDGE VOLTOU AO NORMAL\n\n"
             f"Horário: {local_time_text()}\n"
@@ -804,11 +851,15 @@ def main():
         send_telegram(message)
         print(message)
 
-    if not events and not manual_request and not was_in_error:
-        print("Sem mudanças relevantes. Nenhuma notificação enviada.")
+    if not events and not manual_request and not was_error_notified:
+        if had_failed_check:
+            print("Falha isolada anterior resolvida silenciosamente.")
+        else:
+            print("Sem mudanças relevantes. Nenhuma notificação enviada.")
 
-    # Sem heartbeat: o Telegram só recebe mudança, consulta manual, erro ou recuperação.
-    if old_units != new_units or was_in_error:
+    # Sem heartbeat. Salvamos quando houve mudança OU quando precisamos zerar
+    # o contador de falhas de uma execução anterior.
+    if old_units != new_units or had_failed_check:
         save_success_state(new_units, old_state)
 
 
