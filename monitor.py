@@ -95,25 +95,25 @@ def parse_floorplan(plan, body):
 
 
 def fetch_floorplan(plan):
-    # Se uma tentativa falhar, tenta novamente imediatamente NA MESMA execução.
-    # Alterna também a forma da URL para tentar outra rota DNS/CDN.
+    """
+    Primeiro tenta o site oficial diretamente.
+    Se a rota do GitHub para o site estiver com timeout, usa o Jina Reader
+    como rota alternativa para buscar A MESMA página oficial.
+    """
     slug = plan.lower()
-    normal = f"https://bainbridgegrand.com/floorplans/{slug}/"
-    no_slash = f"https://bainbridgegrand.com/floorplans/{slug}"
-    www = f"https://www.bainbridgegrand.com/floorplans/{slug}/"
-
-    attempts = [
-        (normal, (7, 18), 1),
-        (normal, (7, 18), 1),
-        (no_slash, (7, 18), 2),
-        (www, (7, 18), 3),
-        (normal, (9, 22), 0),
-    ]
+    target = f"https://bainbridgegrand.com/floorplans/{slug}/"
+    www_target = f"https://www.bainbridgegrand.com/floorplans/{slug}/"
 
     errors = []
-    for n, (url, timeout, wait_after) in enumerate(attempts, start=1):
+
+    direct_attempts = [
+        (target, (6, 18)),
+        (www_target, (6, 18)),
+    ]
+
+    for n, (url, timeout) in enumerate(direct_attempts, start=1):
         try:
-            print(f"Consultando {plan}: tentativa {n}/{len(attempts)}")
+            print(f"Consultando {plan} direto: tentativa {n}/{len(direct_attempts)}")
             response = requests.get(
                 url,
                 headers=HEADERS,
@@ -122,17 +122,58 @@ def fetch_floorplan(plan):
             )
             response.raise_for_status()
             units = parse_floorplan(plan, response.text)
-            print(f"{plan}: OK na tentativa {n} ({len(units)} unidades)")
+            print(f"{plan}: OK direto na tentativa {n} ({len(units)} unidades)")
             return units
         except Exception as exc:
-            errors.append(str(exc))
-            print(f"{plan}: tentativa {n} falhou: {exc}", file=sys.stderr)
-            if wait_after:
-                time.sleep(wait_after)
+            errors.append(f"direto {n}: {exc}")
+            print(f"{plan}: tentativa direta {n} falhou: {exc}", file=sys.stderr)
+            time.sleep(1)
+
+    # Fallback real: outra infraestrutura faz a leitura da mesma página oficial.
+    # X-No-Cache força uma nova busca para reduzir risco de conteúdo antigo.
+    reader_url = f"https://r.jina.ai/{target}"
+    reader_attempts = [
+        {
+            "Accept": "text/plain",
+            "X-No-Cache": "true",
+        },
+        {
+            "Accept": "text/plain",
+            "X-No-Cache": "true",
+            "X-Engine": "browser",
+        },
+    ]
+
+    for n, reader_headers in enumerate(reader_attempts, start=1):
+        try:
+            print(f"Consultando {plan} via fallback Jina: tentativa {n}/{len(reader_attempts)}")
+            response = requests.get(
+                reader_url,
+                headers=reader_headers,
+                timeout=(8, 35),
+            )
+            response.raise_for_status()
+
+            units = parse_floorplan(plan, response.text)
+
+            print(
+                f"{plan}: OK via fallback Jina na tentativa {n} "
+                f"({len(units)} unidades)"
+            )
+            return units
+
+        except Exception as exc:
+            errors.append(f"fallback {n}: {exc}")
+            print(
+                f"{plan}: fallback Jina {n} falhou: {exc}",
+                file=sys.stderr,
+            )
+            time.sleep(2)
 
     raise RuntimeError(
-        f"Falha ao consultar {plan} após {len(attempts)} tentativas na mesma execução. "
-        f"Últimos erros: {' | '.join(errors[-3:])}"
+        f"Falha ao consultar {plan}. "
+        "Tentei o site oficial diretamente e também uma rota alternativa. "
+        f"Últimos erros: {' | '.join(errors[-4:])}"
     )
 
 
