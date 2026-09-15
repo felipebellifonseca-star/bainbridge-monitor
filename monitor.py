@@ -42,6 +42,15 @@ UNIT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+MANUAL_COMMANDS = {
+    "/check",
+    "/status",
+    "/buscar",
+    "/verificar",
+    "/teste",
+    "🔎 verificar agora",
+}
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -130,8 +139,12 @@ def save_success_state(
         "max_rent": MAX_RENT,
         "units": dict(sorted(units.items())),
     }
+
     if last_heartbeat:
         payload["last_heartbeat_utc"] = last_heartbeat
+
+    if previous_state.get("telegram_update_id") is not None:
+        payload["telegram_update_id"] = previous_state["telegram_update_id"]
 
     write_state(payload)
 
@@ -141,8 +154,6 @@ def record_failure(exc: Exception) -> None:
     already_in_error = state.get("monitor_status") == "error"
     error_text = str(exc)[:500]
 
-    # Envia somente o primeiro alerta. Enquanto continuar quebrado, fica silencioso
-    # no Telegram para não gerar uma mensagem a cada 5 minutos.
     if not already_in_error:
         try:
             send_telegram(
@@ -159,12 +170,12 @@ def record_failure(exc: Exception) -> None:
                 file=sys.stderr,
             )
 
-        payload = dict(state)
-        payload["monitor_status"] = "error"
-        payload["last_error_utc"] = utc_now().isoformat()
-        payload["last_error_message"] = error_text
-        payload["updated_at_utc"] = utc_now().isoformat()
-        write_state(payload)
+    payload = dict(state)
+    payload["monitor_status"] = "error"
+    payload["last_error_utc"] = utc_now().isoformat()
+    payload["last_error_message"] = error_text
+    payload["updated_at_utc"] = utc_now().isoformat()
+    write_state(payload)
 
 
 def keepalive_due(state: dict) -> bool:
@@ -229,6 +240,7 @@ def current_summary(units: dict) -> str:
     lines = [unit_line(unit) for unit in ordered]
     b1 = sum(1 for unit in ordered if unit["plan"] == "B1")
     b2 = sum(1 for unit in ordered if unit["plan"] == "B2")
+
     return (
         f"Unidades até {money(MAX_RENT)}: B1={b1} | B2={b2}\n"
         + "\n".join(lines)
@@ -250,7 +262,10 @@ def detect_changes(old_units: dict, new_units: dict) -> list[str]:
                 f"Antes: {money(old['price'])}"
             )
         else:
-            events.append("🏠 NOVA UNIDADE NO SEU FILTRO\n" f"{unit_line(new)}")
+            events.append(
+                "🏠 NOVA UNIDADE NO SEU FILTRO\n"
+                f"{unit_line(new)}"
+            )
 
     for key in sorted(set(old_q) - set(new_q)):
         old = old_q[key]
@@ -263,7 +278,10 @@ def detect_changes(old_units: dict, new_units: dict) -> list[str]:
                 f"Disponibilidade atual: {new['availability']}"
             )
         else:
-            events.append("❌ NÃO APARECE MAIS COMO DISPONÍVEL\n" f"{unit_line(old)}")
+            events.append(
+                "❌ NÃO APARECE MAIS COMO DISPONÍVEL\n"
+                f"{unit_line(old)}"
+            )
 
     for key in sorted(set(old_q) & set(new_q)):
         old = old_q[key]
@@ -289,6 +307,13 @@ def detect_changes(old_units: dict, new_units: dict) -> list[str]:
             )
 
     return events
+
+
+def telegram_token() -> str:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("Secret TELEGRAM_BOT_TOKEN não configurado no GitHub.")
+    return token
 
 
 def telegram_chat_id(token: str) -> str:
@@ -318,12 +343,18 @@ def telegram_chat_id(token: str) -> str:
     )
 
 
-def send_telegram(text: str, include_chat_id: bool = False) -> str:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("Secret TELEGRAM_BOT_TOKEN não configurado no GitHub.")
+def telegram_keyboard() -> dict:
+    return {
+        "keyboard": [[{"text": "🔎 Verificar agora"}]],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
 
+
+def send_telegram(text: str, include_chat_id: bool = False) -> str:
+    token = telegram_token()
     chat_id = telegram_chat_id(token)
+
     text_to_send = text
     if include_chat_id:
         text_to_send += (
@@ -339,6 +370,7 @@ def send_telegram(text: str, include_chat_id: bool = False) -> str:
             "chat_id": chat_id,
             "text": text_to_send,
             "disable_web_page_preview": True,
+            "reply_markup": telegram_keyboard(),
         },
         timeout=20,
     )
@@ -349,6 +381,49 @@ def send_telegram(text: str, include_chat_id: bool = False) -> str:
         raise RuntimeError(f"Telegram retornou erro: {payload}")
 
     return chat_id
+
+
+def poll_manual_request(state: dict) -> tuple[bool, int | None]:
+    token = telegram_token()
+    expected_chat_id = telegram_chat_id(token)
+    last_update_id = state.get("telegram_update_id")
+    params = {"timeout": 0}
+
+    if isinstance(last_update_id, int):
+        params["offset"] = last_update_id + 1
+
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    data = response.json()
+
+    if not data.get("ok"):
+        raise RuntimeError("Telegram getUpdates retornou erro.")
+
+    requested = False
+    newest_id = last_update_id
+
+    for update in data.get("result", []):
+        update_id = update.get("update_id")
+        if isinstance(update_id, int):
+            newest_id = max(newest_id or update_id, update_id)
+
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            continue
+
+        chat = message.get("chat", {})
+        chat_id = str(chat.get("id", ""))
+        if chat.get("type") != "private":
+            continue
+        if expected_chat_id and chat_id != expected_chat_id:
+            continue
+
+        text = (message.get("text") or "").strip().lower()
+        if text in MANUAL_COMMANDS:
+            requested = True
+
+    return requested, newest_id
 
 
 def heartbeat_message(units: dict) -> str:
@@ -364,25 +439,30 @@ def heartbeat_message(units: dict) -> str:
 
 
 def main() -> None:
+    # Teste manual do GitHub: testa só o Telegram, sem depender do site.
+    if TEST_MODE:
+        send_telegram(
+            "🧪 TESTE DO MONITOR BAINBRIDGE: OK\n\n"
+            f"Horário: {local_time_text()}\n"
+            "Telegram: OK\n"
+            "Este teste não depende do site do Bainbridge.",
+            include_chat_id=True,
+        )
+        print("Teste do Telegram concluído com sucesso.")
+        return
+
     old_state = load_state()
     old_units = old_state.get("units", {})
+
+    # Lê pedidos enviados pelo botão/comando no Telegram.
+    manual_request, newest_update_id = poll_manual_request(old_state)
+    if newest_update_id is not None and newest_update_id != old_state.get("telegram_update_id"):
+        old_state["telegram_update_id"] = newest_update_id
+        write_state(old_state)
 
     new_units = {}
     for plan in FLOORPLANS:
         new_units.update(fetch_floorplan(plan))
-
-    # Modo de teste manual: consulta o site e testa o Telegram, mas não mexe no estado.
-    if TEST_MODE:
-        message = (
-            "🧪 TESTE DO MONITOR BAINBRIDGE: OK\n\n"
-            f"Horário: {local_time_text()}\n"
-            "Leitura de B1/B2: OK\n"
-            "Telegram: OK\n\n"
-            + current_summary(new_units)
-        )
-        send_telegram(message, include_chat_id=True)
-        print("Teste concluído com sucesso. Mensagem enviada ao Telegram.")
-        return
 
     if not old_units:
         message = (
@@ -416,6 +496,17 @@ def main() -> None:
         notification_sent = True
         print(recovery)
 
+    if manual_request:
+        manual_message = (
+            "🔎 CONSULTA MANUAL BAINBRIDGE\n\n"
+            f"Horário: {local_time_text()}\n"
+            "Consulta concluída com sucesso.\n\n"
+            + current_summary(new_units)
+        )
+        send_telegram(manual_message)
+        notification_sent = True
+        print(manual_message)
+
     if events:
         message = (
             "🚨 BAINBRIDGE THE GRAND\n\n"
@@ -429,18 +520,19 @@ def main() -> None:
         send_telegram(message)
         notification_sent = True
         print(message)
-    elif not was_in_error and heartbeat_due(old_state):
+    elif not manual_request and not was_in_error and heartbeat_due(old_state):
         message = heartbeat_message(new_units)
         send_telegram(message)
         notification_sent = True
         print(message)
-    elif not was_in_error:
+    elif not manual_request and not was_in_error:
         print("Sem mudanças relevantes. Heartbeat ainda não venceu.")
 
     if (
         old_units != new_units
         or notification_sent
         or was_in_error
+        or newest_update_id is not None
         or keepalive_due(old_state)
     ):
         save_success_state(
