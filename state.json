@@ -4,7 +4,7 @@
   "last_success_utc": "2026-09-15T10:09:46.662410+00:00",
   "max_rent": 2700,
   "monitor_status": "ok",
-  "telegram_update_id": 879278898,
+  "telegram_update_id": 879278901,
   "units": {
     "B1-1119": {
       "availability": "Nov 09",
@@ -160,5 +160,5 @@
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     }
   },
-  "updated_at_utc": "2026-09-15T10:09:46.662410+00:00"
+  "updated_at_utc": "2026-09-15T10:23:16.946631+00:00"
 }
