@@ -14,7 +14,6 @@ BASE_URL = "https://bainbridgegrand.com/floorplans"
 FLOORPLANS = ("B1", "B2")
 MAX_RENT = int(os.getenv("MAX_RENT", "2700"))
 STATE_FILE = Path("state.json")
-HEARTBEAT_MINUTES = 60
 LOCAL_TZ = ZoneInfo("America/New_York")
 TEST_MODE = os.getenv("TEST_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -27,6 +26,7 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
+    "Connection": "close",
 }
 
 UNIT_PATTERN = re.compile(
@@ -34,1205 +34,518 @@ UNIT_PATTERN = re.compile(
     r"Floor\s+(?P<floor>\d+)\s+"
     r"(?P<sqft>[\d,]+)\s+sq\.?\s*ft\.?\s+"
     r"Starting\s+at\s+\$(?P<price>[\d,]+)\s+"
-    r"Available\s+(?P<availability>"
-    r"Now|[A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?"
-    r")",
+    r"Available\s+(?P<availability>Now|[A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?)",
     re.IGNORECASE,
 )
 
 MANUAL_COMMANDS = {"/check", "/status", "/buscar", "/verificar", "/teste"}
 
 
-def utc_now() -> datetime:
+def utc_now():
     return datetime.now(timezone.utc)
 
 
-def local_time_text() -> str:
+def local_time_text():
     return datetime.now(LOCAL_TZ).strftime("%I:%M %p").lstrip("0")
 
 
-def money(value: int) -> str:
+def money(value):
     return f"${value:,.0f}"
 
 
-def load_state() -> dict:
+def load_state():
     if not STATE_FILE.exists():
         return {}
-
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
-def write_state(state: dict) -> None:
+def write_state(state):
     STATE_FILE.write_text(
         json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
 
-def fetch_floorplan(plan: str) -> dict:
-    url = f"{BASE_URL}/{plan.lower()}/"
-    last_error = None
+def parse_floorplan(plan, body):
+    text = " ".join(BeautifulSoup(body, "html.parser").stripped_strings)
+    matches = list(UNIT_PATTERN.finditer(text))
+    if not matches:
+        raise RuntimeError(
+            f"Nenhuma unidade foi reconhecida em {plan}. "
+            "O site pode ter retornado uma página incompleta ou mudado de estrutura."
+        )
 
-    for attempt in range(3):
+    units = {}
+    for match in matches:
+        data = match.groupdict()
+        number = data["unit"]
+        units[f"{plan}-{number}"] = {
+            "plan": plan,
+            "unit": number,
+            "floor": int(data["floor"]),
+            "sqft": int(data["sqft"].replace(",", "")),
+            "price": int(data["price"].replace(",", "")),
+            "availability": " ".join(data["availability"].split()),
+            "url": f"{BASE_URL}/{plan.lower()}/",
+        }
+    return units
+
+
+def fetch_floorplan(plan):
+    # Se uma tentativa falhar, tenta novamente imediatamente NA MESMA execução.
+    # Alterna também a forma da URL para tentar outra rota DNS/CDN.
+    slug = plan.lower()
+    normal = f"https://bainbridgegrand.com/floorplans/{slug}/"
+    no_slash = f"https://bainbridgegrand.com/floorplans/{slug}"
+    www = f"https://www.bainbridgegrand.com/floorplans/{slug}/"
+
+    attempts = [
+        (normal, (7, 18), 1),
+        (normal, (7, 18), 1),
+        (no_slash, (7, 18), 2),
+        (www, (7, 18), 3),
+        (normal, (9, 22), 0),
+    ]
+
+    errors = []
+    for n, (url, timeout, wait_after) in enumerate(attempts, start=1):
         try:
-            response = requests.get(url, headers=HEADERS, timeout=25)
+            print(f"Consultando {plan}: tentativa {n}/{len(attempts)}")
+            response = requests.get(
+                url,
+                headers=HEADERS,
+                timeout=timeout,
+                allow_redirects=True,
+            )
             response.raise_for_status()
-
-            text = " ".join(
-                BeautifulSoup(
-                    response.text,
-                    "html.parser"
-                ).stripped_strings
-            )
-
-            matches = list(
-                UNIT_PATTERN.finditer(text)
-            )
-
-            if not matches:
-                raise RuntimeError(
-                    f"Nenhuma unidade foi reconhecida em {plan}. "
-                    "O site pode ter mudado de estrutura."
-                )
-
-            units = {}
-
-            for match in matches:
-                data = match.groupdict()
-                number = data["unit"]
-
-                units[f"{plan}-{number}"] = {
-                    "plan": plan,
-                    "unit": number,
-                    "floor": int(data["floor"]),
-                    "sqft": int(
-                        data["sqft"].replace(",", "")
-                    ),
-                    "price": int(
-                        data["price"].replace(",", "")
-                    ),
-                    "availability": " ".join(
-                        data["availability"].split()
-                    ),
-                    "url": url,
-                }
-
+            units = parse_floorplan(plan, response.text)
+            print(f"{plan}: OK na tentativa {n} ({len(units)} unidades)")
             return units
-
         except Exception as exc:
-            last_error = exc
-
-            if attempt < 2:
-                time.sleep(
-                    4 * (attempt + 1)
-                )
+            errors.append(str(exc))
+            print(f"{plan}: tentativa {n} falhou: {exc}", file=sys.stderr)
+            if wait_after:
+                time.sleep(wait_after)
 
     raise RuntimeError(
-        f"Falha ao consultar {plan}: {last_error}"
+        f"Falha ao consultar {plan} após {len(attempts)} tentativas na mesma execução. "
+        f"Últimos erros: {' | '.join(errors[-3:])}"
     )
 
 
-def qualifying(units: dict) -> dict:
-    return {
-        key: value
-        for key, value in units.items()
-        if value["price"] <= MAX_RENT
-    }
+def qualifying(units):
+    return {k: v for k, v in units.items() if v["price"] <= MAX_RENT}
 
 
-def is_priority(unit: dict) -> bool:
+def is_priority(unit):
     return (
         unit.get("plan") == "B2"
-        and int(
-            unit.get("floor", 0)
-        ) == 5
-        and int(
-            unit.get(
-                "price",
-                MAX_RENT + 1
-            )
-        ) <= MAX_RENT
+        and int(unit.get("floor", 0)) == 5
+        and int(unit.get("price", MAX_RENT + 1)) <= MAX_RENT
     )
 
 
-def unit_line(unit: dict) -> str:
-    prefix = (
-        "🔥 PRIORIDADE | "
-        if is_priority(unit)
-        else ""
-    )
-
+def unit_line(unit):
+    prefix = "🔥 PRIORIDADE | " if is_priority(unit) else ""
     return (
-        f"{prefix}"
-        f"{unit['plan']} "
-        f"#{unit['unit']} | "
-        f"{unit['floor']}º andar | "
-        f"{money(unit['price'])} | "
-        f"{unit['availability']}"
+        f"{prefix}{unit['plan']} #{unit['unit']} | "
+        f"{unit['floor']}º andar | {money(unit['price'])} | {unit['availability']}"
     )
 
 
-def current_summary(units: dict) -> str:
-    filtered = qualifying(units)
+def current_summary(units):
+    q = qualifying(units)
+    if not q:
+        return f"Nenhuma B1/B2 até {money(MAX_RENT)} neste momento."
 
-    if not filtered:
-        return (
-            f"Nenhuma B1/B2 até "
-            f"{money(MAX_RENT)} "
-            "neste momento."
-        )
-
-    ordered = sorted(
-        filtered.values(),
-        key=lambda x: (
-            x["plan"],
-            x["floor"],
-            int(x["unit"]),
-        ),
-    )
-
-    b1 = sum(
-        1
-        for unit in ordered
-        if unit["plan"] == "B1"
-    )
-
-    b2 = sum(
-        1
-        for unit in ordered
-        if unit["plan"] == "B2"
-    )
-
+    ordered = sorted(q.values(), key=lambda x: (x["plan"], x["floor"], int(x["unit"])))
+    b1 = sum(1 for u in ordered if u["plan"] == "B1")
+    b2 = sum(1 for u in ordered if u["plan"] == "B2")
     return (
-        f"Unidades até "
-        f"{money(MAX_RENT)}: "
-        f"B1={b1} | B2={b2}\n"
-        + "\n".join(
-            unit_line(unit)
-            for unit in ordered
-        )
+        f"Unidades até {money(MAX_RENT)}: B1={b1} | B2={b2}\n"
+        + "\n".join(unit_line(u) for u in ordered)
     )
 
 
-def detect_changes(
-    old_units: dict,
-    new_units: dict,
-) -> list[str]:
-
+def detect_changes(old_units, new_units):
     events = []
-
     old_q = qualifying(old_units)
     new_q = qualifying(new_units)
 
-    for key in sorted(
-        set(new_q) - set(old_q)
-    ):
+    for key in sorted(set(new_q) - set(old_q)):
         new = new_q[key]
-
         if is_priority(new):
-            heading = (
-                "🔥🔥 PRIORIDADE: "
-                "B2 NO 5º ANDAR"
-            )
-
+            heading = "🔥🔥 PRIORIDADE: B2 NO 5º ANDAR"
         elif key in old_units:
-            heading = (
-                "💰 ENTROU NO SEU LIMITE"
-            )
-
+            heading = "💰 ENTROU NO SEU LIMITE"
         else:
-            heading = (
-                "🏠 NOVA UNIDADE "
-                "NO SEU FILTRO"
-            )
+            heading = "🏠 NOVA UNIDADE NO SEU FILTRO"
 
         if key in old_units:
             events.append(
-                f"{heading}\n"
-                f"{unit_line(new)}\n"
-                f"Antes: "
-                f"{money(old_units[key]['price'])}"
+                f"{heading}\n{unit_line(new)}\nAntes: {money(old_units[key]['price'])}"
             )
-
         else:
-            events.append(
-                f"{heading}\n"
-                f"{unit_line(new)}"
-            )
+            events.append(f"{heading}\n{unit_line(new)}")
 
-    for key in sorted(
-        set(old_q) - set(new_q)
-    ):
+    for key in sorted(set(old_q) - set(new_q)):
         old = old_q[key]
-
         if key in new_units:
             new = new_units[key]
-
             events.append(
                 "⬆️ SAIU DO SEU LIMITE\n"
-                f"{old['plan']} "
-                f"#{old['unit']} | "
-                f"{old['floor']}º andar\n"
-                f"Antes: "
-                f"{money(old['price'])} | "
-                f"Agora: "
-                f"{money(new['price'])}\n"
-                f"Disponibilidade atual: "
-                f"{new['availability']}"
+                f"{old['plan']} #{old['unit']} | {old['floor']}º andar\n"
+                f"Antes: {money(old['price'])} | Agora: {money(new['price'])}\n"
+                f"Disponibilidade atual: {new['availability']}"
             )
-
         else:
-            events.append(
-                "❌ NÃO APARECE MAIS "
-                "COMO DISPONÍVEL\n"
-                f"{unit_line(old)}"
-            )
+            events.append(f"❌ NÃO APARECE MAIS COMO DISPONÍVEL\n{unit_line(old)}")
 
-    for key in sorted(
-        set(old_q) & set(new_q)
-    ):
-        old = old_q[key]
-        new = new_q[key]
-
+    for key in sorted(set(old_q) & set(new_q)):
+        old, new = old_q[key], new_q[key]
         changes = []
-
         if old["price"] != new["price"]:
-            changes.append(
-                f"Preço: "
-                f"{money(old['price'])} → "
-                f"{money(new['price'])}"
-            )
-
-        if (
-            old["availability"]
-            != new["availability"]
-        ):
-            changes.append(
-                f"Disponibilidade: "
-                f"{old['availability']} → "
-                f"{new['availability']}"
-            )
-
+            changes.append(f"Preço: {money(old['price'])} → {money(new['price'])}")
+        if old["availability"] != new["availability"]:
+            changes.append(f"Disponibilidade: {old['availability']} → {new['availability']}")
         if old["floor"] != new["floor"]:
-            changes.append(
-                f"Andar: "
-                f"{old['floor']} → "
-                f"{new['floor']}"
-            )
-
+            changes.append(f"Andar: {old['floor']} → {new['floor']}")
         if old["sqft"] != new["sqft"]:
-            changes.append(
-                f"Área: "
-                f"{old['sqft']} → "
-                f"{new['sqft']} sq. ft."
-            )
+            changes.append(f"Área: {old['sqft']} → {new['sqft']} sq. ft.")
 
         if changes:
             heading = (
-                "🔥🔥 PRIORIDADE: "
-                "ALTERAÇÃO EM B2 NO 5º ANDAR"
+                "🔥🔥 PRIORIDADE: ALTERAÇÃO EM B2 NO 5º ANDAR"
                 if is_priority(new)
-                else
-                "🔄 ALTERAÇÃO"
+                else "🔄 ALTERAÇÃO"
             )
-
-            events.append(
-                f"{heading}\n"
-                f"{unit_line(new)}\n"
-                + "\n".join(changes)
-            )
+            events.append(f"{heading}\n{unit_line(new)}\n" + "\n".join(changes))
 
     return events
 
 
-def telegram_token() -> str:
-    token = os.getenv(
-        "TELEGRAM_BOT_TOKEN",
-        "",
-    ).strip()
-
+def telegram_token():
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        raise RuntimeError(
-            "Secret TELEGRAM_BOT_TOKEN "
-            "não configurado no GitHub."
-        )
-
+        raise RuntimeError("Secret TELEGRAM_BOT_TOKEN não configurado no GitHub.")
     return token
 
 
-def get_updates(
-    token: str,
-    offset: int | None = None,
-) -> list[dict]:
-
-    params = {
-        "timeout": 0
-    }
-
+def get_updates(token, offset=None):
+    params = {"timeout": 0}
     if offset is not None:
         params["offset"] = offset
-
     response = requests.get(
-        f"https://api.telegram.org/"
-        f"bot{token}/getUpdates",
+        f"https://api.telegram.org/bot{token}/getUpdates",
         params=params,
         timeout=20,
     )
-
     response.raise_for_status()
-
     data = response.json()
-
     if not data.get("ok"):
-        raise RuntimeError(
-            "Telegram getUpdates retornou erro."
-        )
-
+        raise RuntimeError("Telegram getUpdates retornou erro.")
     return data.get("result", [])
 
 
-def configured_chat_id(
-    token: str,
-) -> str:
-
-    explicit = os.getenv(
-        "TELEGRAM_CHAT_ID",
-        "",
-    ).strip()
-
+def configured_chat_id(token):
+    explicit = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if explicit:
         return explicit
 
-    for update in reversed(
-        get_updates(token)
-    ):
-        message = (
-            update.get("message")
-            or update.get("edited_message")
-        )
-
-        if not message:
-            continue
-
-        chat = message.get(
-            "chat",
-            {},
-        )
-
-        if (
-            chat.get("id") is not None
-            and chat.get("type") == "private"
-        ):
-            return str(
-                chat["id"]
-            )
-
-    raise RuntimeError(
-        "Não encontrei um chat configurado. "
-        "Configure TELEGRAM_CHAT_ID "
-        "nos Secrets do GitHub."
-    )
+    for update in reversed(get_updates(token)):
+        message = update.get("message") or update.get("edited_message")
+        if message and (message.get("chat") or {}).get("id") is not None:
+            return str(message["chat"]["id"])
+    raise RuntimeError("Não encontrei um chat configurado. Configure TELEGRAM_CHAT_ID.")
 
 
-def telegram_keyboard() -> dict:
+def telegram_keyboard():
     return {
         "inline_keyboard": [
+            [{"text": "🔎 Verificar agora", "callback_data": "check_now"}],
             [
-                {
-                    "text": "🔎 Verificar agora",
-                    "callback_data": "check_now",
-                }
-            ],
-            [
-                {
-                    "text": "🏠 Abrir B1",
-                    "url": (
-                        f"{BASE_URL}/b1/"
-                    ),
-                },
-                {
-                    "text": "🏠 Abrir B2",
-                    "url": (
-                        f"{BASE_URL}/b2/"
-                    ),
-                },
+                {"text": "🏠 Abrir B1", "url": f"{BASE_URL}/b1/"},
+                {"text": "🏠 Abrir B2", "url": f"{BASE_URL}/b2/"},
             ],
         ]
     }
 
 
-def send_to_chat(
-    chat_id: str,
-    text: str,
-    buttons: bool = True,
-) -> None:
-
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
-
+def send_to_chat(chat_id, text, buttons=True):
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
     if buttons:
-        payload[
-            "reply_markup"
-        ] = telegram_keyboard()
+        payload["reply_markup"] = telegram_keyboard()
 
     response = requests.post(
-        f"https://api.telegram.org/"
-        f"bot{telegram_token()}/sendMessage",
+        f"https://api.telegram.org/bot{telegram_token()}/sendMessage",
         json=payload,
         timeout=20,
     )
-
     response.raise_for_status()
-
     data = response.json()
-
     if not data.get("ok"):
-        raise RuntimeError(
-            f"Telegram retornou erro: "
-            f"{data}"
-        )
+        raise RuntimeError(f"Telegram retornou erro: {data}")
 
 
-def send_telegram(
-    text: str,
-    include_chat_id: bool = False,
-) -> str:
-
+def send_telegram(text, include_chat_id=False):
     token = telegram_token()
-
-    chat_id = configured_chat_id(
-        token
-    )
-
+    chat_id = configured_chat_id(token)
     if include_chat_id:
-        text += (
-            "\n\n🔐 Chat ID configurado:\n"
-            f"{chat_id}"
-        )
-
-    send_to_chat(
-        chat_id,
-        text,
-        buttons=True,
-    )
-
+        text += f"\n\n🔐 Chat ID configurado:\n{chat_id}"
+    send_to_chat(chat_id, text, buttons=True)
     return chat_id
 
 
-def normalize_command(
-    text: str,
-) -> str:
-
-    parts = (
-        text or ""
-    ).strip().lower().split(
-        maxsplit=1
-    )
-
+def normalize_command(text):
+    parts = (text or "").strip().lower().split(maxsplit=1)
     if not parts:
         return ""
-
     command = parts[0]
-
-    if (
-        command.startswith("/")
-        and "@" in command
-    ):
-        command = command.split(
-            "@",
-            1
-        )[0]
-
+    if command.startswith("/") and "@" in command:
+        command = command.split("@", 1)[0]
     return command
 
 
-def reply_with_chat_id(
-    chat: dict,
-) -> None:
-
-    chat_id = str(
-        chat.get("id", "")
-    )
-
-    chat_type = chat.get(
-        "type",
-        "",
-    )
-
-    title = chat.get(
-        "title"
-    ) or ""
-
+def reply_with_chat_id(chat):
+    chat_id = str(chat.get("id", ""))
     if not chat_id:
         return
-
-    if chat_type in {
-        "group",
-        "supergroup",
-    }:
-        title_line = (
-            f"Grupo: {title}\n"
-            if title
-            else ""
-        )
-
+    if chat.get("type") in {"group", "supergroup"}:
+        title = chat.get("title") or ""
+        title_line = f"Grupo: {title}\n" if title else ""
         text = (
             "🔐 CHAT ID DO GRUPO\n\n"
-            f"{title_line}"
-            f"Chat ID: {chat_id}\n\n"
-            "Agora substitua o secret "
-            "TELEGRAM_CHAT_ID no GitHub "
-            "por este número."
+            f"{title_line}Chat ID: {chat_id}\n\n"
+            "Use este número no secret TELEGRAM_CHAT_ID do GitHub."
         )
-
     else:
-        text = (
-            "🔐 SEU TELEGRAM CHAT ID\n\n"
-            f"Chat ID: {chat_id}"
-        )
-
-    send_to_chat(
-        chat_id,
-        text,
-        buttons=False,
-    )
+        text = f"🔐 SEU TELEGRAM CHAT ID\n\nChat ID: {chat_id}"
+    send_to_chat(chat_id, text, buttons=False)
 
 
-def answer_callback(
-    token: str,
-    callback_id: str,
-) -> None:
-
+def answer_callback(token, callback_id):
     try:
         requests.post(
-            f"https://api.telegram.org/"
-            f"bot{token}/answerCallbackQuery",
+            f"https://api.telegram.org/bot{token}/answerCallbackQuery",
             json={
-                "callback_query_id":
-                    callback_id,
-                "text": (
-                    "Pedido recebido. "
-                    "Vou verificar "
-                    "na próxima execução."
-                ),
+                "callback_query_id": callback_id,
+                "text": "Pedido recebido. Vou verificar na próxima execução.",
             },
             timeout=10,
         )
-
     except Exception:
         pass
 
 
-def poll_telegram_requests(
-    state: dict,
-) -> tuple[bool, int | None]:
-
+def poll_telegram_requests(state):
     token = telegram_token()
-
-    expected_chat_id = (
-        configured_chat_id(token)
-    )
-
-    last_update_id = state.get(
-        "telegram_update_id"
-    )
-
-    offset = (
-        last_update_id + 1
-        if isinstance(
-            last_update_id,
-            int,
-        )
-        else None
-    )
-
-    updates = get_updates(
-        token,
-        offset=offset,
-    )
+    expected_chat_id = configured_chat_id(token)
+    last_update_id = state.get("telegram_update_id")
+    offset = last_update_id + 1 if isinstance(last_update_id, int) else None
+    updates = get_updates(token, offset=offset)
 
     manual_requested = False
     newest_id = last_update_id
 
     for update in updates:
+        update_id = update.get("update_id")
+        if isinstance(update_id, int):
+            newest_id = update_id if newest_id is None else max(newest_id, update_id)
 
-        update_id = update.get(
-            "update_id"
-        )
-
-        if isinstance(
-            update_id,
-            int,
-        ):
-            newest_id = (
-                update_id
-                if newest_id is None
-                else max(
-                    newest_id,
-                    update_id,
-                )
-            )
-
-        callback = update.get(
-            "callback_query"
-        )
-
+        callback = update.get("callback_query")
         if callback:
-            message = (
-                callback.get("message")
-                or {}
-            )
-
-            source_chat_id = str(
-                (
-                    message.get("chat")
-                    or {}
-                ).get("id", "")
-            )
-
-            if (
-                source_chat_id
-                == expected_chat_id
-                and callback.get("data")
-                == "check_now"
-            ):
+            message = callback.get("message") or {}
+            source_chat_id = str((message.get("chat") or {}).get("id", ""))
+            if source_chat_id == expected_chat_id and callback.get("data") == "check_now":
                 manual_requested = True
-
                 if callback.get("id"):
-                    answer_callback(
-                        token,
-                        callback["id"],
-                    )
-
+                    answer_callback(token, callback["id"])
             continue
 
-        message = (
-            update.get("message")
-            or update.get("edited_message")
-        )
-
+        message = update.get("message") or update.get("edited_message")
         if not message:
             continue
 
-        chat = message.get(
-            "chat",
-            {},
-        )
+        chat = message.get("chat", {})
+        source_chat_id = str(chat.get("id", ""))
+        command = normalize_command(message.get("text", ""))
 
-        source_chat_id = str(
-            chat.get("id", "")
-        )
-
-        command = normalize_command(
-            message.get("text", "")
-        )
-
-        # /id funciona em privado ou grupo,
-        # mesmo antes de o grupo virar
-        # o chat oficial do monitor.
         if command == "/id":
             try:
-                reply_with_chat_id(
-                    chat
-                )
-
+                reply_with_chat_id(chat)
             except Exception as exc:
-                print(
-                    f"Não foi possível "
-                    f"responder ao /id: {exc}",
-                    file=sys.stderr,
-                )
-
+                print(f"Não foi possível responder ao /id: {exc}", file=sys.stderr)
             continue
 
-        # Os demais comandos só funcionam
-        # no chat ou grupo configurado.
-        if (
-            source_chat_id
-            == expected_chat_id
-            and command
-            in MANUAL_COMMANDS
-        ):
+        if source_chat_id == expected_chat_id and command in MANUAL_COMMANDS:
             manual_requested = True
 
-    return (
-        manual_requested,
-        newest_id,
-    )
+    return manual_requested, newest_id
 
 
-def heartbeat_due(
-    state: dict,
-) -> bool:
+def save_telegram_offset(state, newest_update_id, manual_requested=False):
+    updated = dict(state)
+    changed = False
 
-    stamp = (
-        state.get("last_heartbeat_utc")
-        or state.get("last_success_utc")
-    )
+    if newest_update_id is not None and newest_update_id != state.get("telegram_update_id"):
+        updated["telegram_update_id"] = newest_update_id
+        changed = True
 
-    if not stamp:
-        return True
+    if manual_requested:
+        updated["manual_pending"] = True
+        changed = True
 
-    try:
-        previous = datetime.fromisoformat(
-            stamp
-        )
+    if changed:
+        updated["updated_at_utc"] = utc_now().isoformat()
+        write_state(updated)
 
-        if previous.tzinfo is None:
-            previous = previous.replace(
-                tzinfo=timezone.utc
-            )
+    return updated
 
-        return (
-            utc_now() - previous
-        ).total_seconds() >= (
-            HEARTBEAT_MINUTES * 60
-        )
-
-    except Exception:
-        return True
-
-
-def heartbeat_message(
-    units: dict,
-) -> str:
-
-    filtered = qualifying(
-        units
-    )
-
-    b1 = sum(
-        1
-        for unit in filtered.values()
-        if unit["plan"] == "B1"
-    )
-
-    b2 = sum(
-        1
-        for unit in filtered.values()
-        if unit["plan"] == "B2"
-    )
-
-    return (
-        "✅ MONITOR BAINBRIDGE ATIVO\n\n"
-        f"Horário: "
-        f"{local_time_text()}\n"
-        "Nenhuma mudança relevante "
-        "desde o último alerta.\n"
-        f"B1 até {money(MAX_RENT)}: "
-        f"{b1} unidade(s)\n"
-        f"B2 até {money(MAX_RENT)}: "
-        f"{b2} unidade(s)\n"
-        "Última consulta: OK"
-    )
-
-
-def save_success_state(
-    units: dict,
-    previous_state: dict,
-    notification_sent: bool = False,
-) -> None:
-
-    now = utc_now()
-
-    last_heartbeat = (
-        previous_state.get(
-            "last_heartbeat_utc"
-        )
-    )
-
-    if notification_sent:
-        last_heartbeat = now.isoformat()
-
-    state = {
-        "updated_at_utc":
-            now.isoformat(),
-        "last_success_utc":
-            now.isoformat(),
-        "monitor_status":
-            "ok",
-        "failure_count":
-            0,
-        "max_rent":
-            MAX_RENT,
-        "units":
-            dict(
-                sorted(
-                    units.items()
-                )
-            ),
+def save_success_state(units, previous_state):
+    now = utc_now().isoformat()
+    payload = {
+        "updated_at_utc": now,
+        "last_success_utc": now,
+        "monitor_status": "ok",
+        "max_rent": MAX_RENT,
+        "units": dict(sorted(units.items())),
     }
-
-    if last_heartbeat:
-        state[
-            "last_heartbeat_utc"
-        ] = last_heartbeat
-
-    if (
-        previous_state.get(
-            "telegram_update_id"
-        )
-        is not None
-    ):
-        state[
-            "telegram_update_id"
-        ] = previous_state[
-            "telegram_update_id"
-        ]
-
-    write_state(
-        state
-    )
+    if previous_state.get("telegram_update_id") is not None:
+        payload["telegram_update_id"] = previous_state["telegram_update_id"]
+    if previous_state.get("manual_pending"):
+        payload["manual_pending"] = True
+    write_state(payload)
 
 
-def record_failure(
-    exc: Exception,
-) -> None:
-
+def record_failure(exc):
     state = load_state()
+    already_in_error = state.get("monitor_status") == "error"
+    error_text = str(exc)[:900]
 
-    error_text = str(
-        exc
-    )[:500]
-
-    try:
-        failure_count = (
-            int(
-                state.get(
-                    "failure_count",
-                    0,
-                )
+    # As tentativas já aconteceram dentro de fetch_floorplan().
+    # Portanto uma falha final já merece um alerta.
+    if not already_in_error:
+        try:
+            send_telegram(
+                "⚠️ ERRO NO MONITOR BAINBRIDGE\n\n"
+                "Tentei várias vezes nesta mesma execução e não consegui concluir a consulta.\n"
+                f"Horário: {local_time_text()}\n"
+                f"Erro: {error_text}\n\n"
+                "Não vou repetir este alerta enquanto o problema continuar. "
+                "Avisarei quando o monitor voltar ao normal."
             )
-            + 1
-        )
+        except Exception as telegram_exc:
+            print(f"Também não consegui enviar o alerta: {telegram_exc}", file=sys.stderr)
 
-    except Exception:
-        failure_count = 1
-
-    already_alerted = (
-        state.get(
-            "monitor_status"
-        )
-        == "error"
-    )
-
-    state[
-        "failure_count"
-    ] = failure_count
-
-    state[
-        "last_error_utc"
-    ] = utc_now().isoformat()
-
-    state[
-        "last_error_message"
-    ] = error_text
-
-    state[
-        "updated_at_utc"
-    ] = utc_now().isoformat()
-
-    if failure_count >= 2:
-
-        state[
-            "monitor_status"
-        ] = "error"
-
-        if not already_alerted:
-            try:
-                send_telegram(
-                    "⚠️ ERRO NO MONITOR "
-                    "BAINBRIDGE\n\n"
-                    "A verificação falhou "
-                    "em 2 execuções "
-                    "consecutivas.\n"
-                    f"Horário: "
-                    f"{local_time_text()}\n"
-                    f"Erro: {error_text}\n\n"
-                    "Não vou repetir este "
-                    "alerta a cada 5 minutos. "
-                    "Avisarei quando o monitor "
-                    "voltar ao normal."
-                )
-
-            except Exception as telegram_exc:
-                print(
-                    "Também não foi possível "
-                    "enviar o alerta no Telegram: "
-                    f"{telegram_exc}",
-                    file=sys.stderr,
-                )
-
+        state["monitor_status"] = "error"
+        state["last_error_utc"] = utc_now().isoformat()
+        state["last_error_message"] = error_text
+        state["updated_at_utc"] = utc_now().isoformat()
+        write_state(state)
     else:
-        state[
-            "monitor_status"
-        ] = state.get(
-            "monitor_status",
-            "ok",
-        )
-
-        print(
-            "Primeira falha consecutiva. "
-            "Vou confirmar na próxima "
-            "execução antes de alertar."
-        )
-
-    write_state(
-        state
-    )
+        print("Monitor já está em erro; alerta repetido suprimido.")
 
 
-def main() -> None:
-
+def main():
     if TEST_MODE:
         send_telegram(
-            "🧪 TESTE DO MONITOR "
-            "BAINBRIDGE: OK\n\n"
-            f"Horário: "
-            f"{local_time_text()}\n"
+            "🧪 TESTE DO MONITOR BAINBRIDGE: OK\n\n"
+            f"Horário: {local_time_text()}\n"
             "Telegram: OK\n"
-            "Este teste não depende "
-            "do site do Bainbridge.",
+            "Este teste não consulta o site do Bainbridge.",
             include_chat_id=True,
         )
-
-        print(
-            "Teste do Telegram "
-            "concluído com sucesso."
-        )
-
+        print("Teste do Telegram concluído com sucesso.")
         return
 
     old_state = load_state()
+    old_units = old_state.get("units", {})
 
-    old_units = old_state.get(
-        "units",
-        {},
-    )
-
-    (
-        manual_request,
+    new_manual_request, newest_update_id = poll_telegram_requests(old_state)
+    old_state = save_telegram_offset(
+        old_state,
         newest_update_id,
-    ) = poll_telegram_requests(
-        old_state
+        manual_requested=new_manual_request,
     )
+    manual_request = bool(old_state.get("manual_pending"))
 
-    if (
-        newest_update_id is not None
-        and newest_update_id
-        != old_state.get(
-            "telegram_update_id"
-        )
-    ):
-        old_state[
-            "telegram_update_id"
-        ] = newest_update_id
-
-        write_state(
-            old_state
-        )
+    if new_manual_request:
+        try:
+            send_telegram(
+                "⏳ PEDIDO RECEBIDO\n\n"
+                "Vou consultar B1 e B2 agora. "
+                "O resultado chega assim que esta execução terminar."
+            )
+        except Exception as exc:
+            print(f"Não consegui enviar confirmação do botão: {exc}", file=sys.stderr)
 
     new_units = {}
-
     for plan in FLOORPLANS:
-        new_units.update(
-            fetch_floorplan(
-                plan
-            )
-        )
+        new_units.update(fetch_floorplan(plan))
 
     if not old_units:
-
         message = (
-            "✅ MONITOR BAINBRIDGE "
-            "ATIVADO\n\n"
+            "✅ MONITOR BAINBRIDGE ATIVADO\n\n"
             "Plantas: B1 e B2\n"
-            f"Preço máximo: "
-            f"{money(MAX_RENT)}\n"
-            "Verificação: aproximadamente "
-            "a cada 5 minutos\n"
-            "Confirmação de funcionamento: "
-            "aproximadamente "
-            "a cada 1 hora\n\n"
-            + current_summary(
-                new_units
-            )
+            f"Preço máximo: {money(MAX_RENT)}\n"
+            "Verificação: aproximadamente a cada 5 minutos\n\n"
+            + current_summary(new_units)
         )
-
-        send_telegram(
-            message
-        )
-
-        save_success_state(
-            new_units,
-            old_state,
-            notification_sent=True,
-        )
-
-        print(
-            message
-        )
-
+        send_telegram(message)
+        save_success_state(new_units, old_state)
+        print(message)
         return
 
-    was_in_error = (
-        old_state.get(
-            "monitor_status"
-        )
-        == "error"
-    )
-
-    events = detect_changes(
-        old_units,
-        new_units,
-    )
-
-    notification_sent = False
+    was_in_error = old_state.get("monitor_status") == "error"
+    events = detect_changes(old_units, new_units)
 
     if was_in_error:
-
         recovery = (
-            "✅ MONITOR BAINBRIDGE "
-            "VOLTOU AO NORMAL\n\n"
-            f"Horário: "
-            f"{local_time_text()}\n"
-            "A consulta de B1 e B2 "
-            "foi concluída com sucesso "
-            "novamente.\n"
-            "O monitor voltou a acompanhar "
-            "normalmente."
+            "✅ MONITOR BAINBRIDGE VOLTOU AO NORMAL\n\n"
+            f"Horário: {local_time_text()}\n"
+            "A consulta de B1 e B2 voltou a funcionar normalmente."
         )
-
-        send_telegram(
-            recovery
-        )
-
-        notification_sent = True
-
-        print(
-            recovery
-        )
+        send_telegram(recovery)
+        print(recovery)
 
     if manual_request:
-
         message = (
-            "🔎 CONSULTA MANUAL "
-            "BAINBRIDGE\n\n"
-            f"Horário: "
-            f"{local_time_text()}\n"
-            "Consulta concluída "
-            "com sucesso.\n\n"
-            + current_summary(
-                new_units
-            )
+            "🔎 CONSULTA MANUAL BAINBRIDGE\n\n"
+            f"Horário: {local_time_text()}\n"
+            "Consulta concluída com sucesso.\n\n"
+            + current_summary(new_units)
         )
-
-        send_telegram(
-            message
-        )
-
-        notification_sent = True
-
-        print(
-            message
-        )
+        send_telegram(message)
+        print(message)
+        old_state.pop("manual_pending", None)
+        old_state["updated_at_utc"] = utc_now().isoformat()
+        write_state(old_state)
 
     if events:
-
         message = (
             "🚨 BAINBRIDGE THE GRAND\n\n"
-            + "\n\n".join(
-                events
-            )
+            + "\n\n".join(events)
             + "\n\n"
-            + current_summary(
-                new_units
-            )
+            + current_summary(new_units)
         )
+        send_telegram(message)
+        print(message)
 
-        send_telegram(
-            message
-        )
+    if not events and not manual_request and not was_in_error:
+        print("Sem mudanças relevantes. Nenhuma notificação enviada.")
 
-        notification_sent = True
-
-        print(
-            message
-        )
-
-    elif (
-        not manual_request
-        and not was_in_error
-        and heartbeat_due(
-            old_state
-        )
-    ):
-
-        message = heartbeat_message(
-            new_units
-        )
-
-        send_telegram(
-            message
-        )
-
-        notification_sent = True
-
-        print(
-            message
-        )
-
-    elif (
-        not manual_request
-        and not was_in_error
-    ):
-        print(
-            "Sem mudanças relevantes. "
-            "Heartbeat ainda não venceu."
-        )
-
-    if (
-        old_units != new_units
-        or notification_sent
-        or was_in_error
-        or newest_update_id is not None
-        or int(
-            old_state.get(
-                "failure_count",
-                0,
-            )
-            or 0
-        ) > 0
-    ):
-
-        save_success_state(
-            new_units,
-            old_state,
-            notification_sent=
-                notification_sent,
-        )
+    # Sem heartbeat: o Telegram só recebe mudança, consulta manual, erro ou recuperação.
+    if old_units != new_units or was_in_error:
+        save_success_state(new_units, old_state)
 
 
 if __name__ == "__main__":
-
     try:
         main()
-
     except Exception as exc:
-
-        print(
-            f"ERRO: {exc}",
-            file=sys.stderr,
-        )
-
-        record_failure(
-            exc
-        )
-
+        print(f"ERRO: {exc}", file=sys.stderr)
+        record_failure(exc)
         raise
