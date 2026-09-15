@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       teste:
-        description: "Enviar teste no Telegram"
+        description: "Testar somente o Telegram"
         required: false
         default: false
         type: boolean
@@ -24,8 +24,11 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Baixar repositório
+      - name: Baixar versão mais recente
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
 
       - name: Configurar Python
         uses: actions/setup-python@v5
@@ -35,19 +38,8 @@ jobs:
       - name: Instalar dependências
         run: pip install -r requirements.txt
 
-      - name: Healthchecks - início
-        continue-on-error: true
-        env:
-          HEALTHCHECKS_PING_URL: ${{ secrets.HEALTHCHECKS_PING_URL }}
-        shell: bash
-        run: |
-          if [[ -n "$HEALTHCHECKS_PING_URL" ]]; then
-            curl -fsS --max-time 10 --retry 3 "$HEALTHCHECKS_PING_URL/start" || true
-          else
-            echo "Healthchecks ainda não configurado."
-          fi
-
       - name: Verificar B1 e B2
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -67,26 +59,4 @@ jobs:
             git push
           else
             echo "state.json sem alterações."
-          fi
-
-      - name: Healthchecks - sucesso
-        if: success()
-        continue-on-error: true
-        env:
-          HEALTHCHECKS_PING_URL: ${{ secrets.HEALTHCHECKS_PING_URL }}
-        shell: bash
-        run: |
-          if [[ -n "$HEALTHCHECKS_PING_URL" ]]; then
-            curl -fsS --max-time 10 --retry 3 "$HEALTHCHECKS_PING_URL" || true
-          fi
-
-      - name: Healthchecks - falha
-        if: failure()
-        continue-on-error: true
-        env:
-          HEALTHCHECKS_PING_URL: ${{ secrets.HEALTHCHECKS_PING_URL }}
-        shell: bash
-        run: |
-          if [[ -n "$HEALTHCHECKS_PING_URL" ]]; then
-            curl -fsS --max-time 10 --retry 3 "$HEALTHCHECKS_PING_URL/fail" || true
           fi
