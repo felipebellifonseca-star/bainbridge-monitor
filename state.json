@@ -1,7 +1,7 @@
 {
   "failure_count": 0,
   "last_heartbeat_utc": "2026-09-15T01:28:37.432417+00:00",
-  "last_success_utc": "2026-09-15T01:28:37.432417+00:00",
+  "last_success_utc": "2026-09-15T01:40:46.167618+00:00",
   "max_rent": 2700,
   "monitor_status": "ok",
   "telegram_update_id": 879278898,
@@ -160,5 +160,5 @@
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     }
   },
-  "updated_at_utc": "2026-09-15T01:28:37.432417+00:00"
+  "updated_at_utc": "2026-09-15T01:40:46.167618+00:00"
 }
