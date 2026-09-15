@@ -18,7 +18,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 BASE_URL = "https://bainbridgegrand.com/floorplans"
 FLOORPLANS = ("B1", "B2")
+A_PLANS = ("A1", "A2", "A3", "A4", "A5", "A6")
 MAX_RENT = int(os.getenv("MAX_RENT", "2700"))
+A_MAX_RENT = int(os.getenv("A_MAX_RENT", "1800"))
 STATE_FILE = Path("state.json")
 LOCAL_TZ = ZoneInfo("America/New_York")
 TEST_MODE = os.getenv("TEST_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -42,6 +44,14 @@ UNIT_PATTERN = re.compile(
     r"(?P<sqft>[\d,]+)\s+sq\.?\s*ft\.?\s+"
     r"Starting\s+at\s+\$(?P<price>[\d,]+)\s+"
     r"Available\s+(?P<availability>Now|[A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?)",
+    re.IGNORECASE,
+)
+
+A_CARD_PATTERN = re.compile(
+    r"(?:View\s+Floorplan\s+)?(?P<plan>A[1-6])\s+"
+    r"1\s*bed\s+1\s*bath\s+"
+    r"(?P<sqft>[\d,]+)\s+sq\.?\s*ft\.?\s+"
+    r"(?:(?:Starting\s+at\s+\$(?P<price>[\d,]+))|Contact\s+Us)",
     re.IGNORECASE,
 )
 
@@ -393,8 +403,146 @@ def fetch_floorplan(plan):
         ) from exc
 
 
+
+def parse_a_cards(text):
+    """Lê os cards A1-A6 da página geral de floorplans."""
+    normalized = " ".join((text or "").split())
+    cards = {}
+
+    for match in A_CARD_PATTERN.finditer(normalized):
+        data = match.groupdict()
+        plan = data["plan"].upper()
+        price = data.get("price")
+        cards[plan] = {
+            "plan": plan,
+            "sqft": int(data["sqft"].replace(",", "")),
+            "price": int(price.replace(",", "")) if price else None,
+        }
+
+    return cards
+
+
+def fetch_a_index_cards():
+    """
+    Consulta a página geral uma única vez para descobrir quais plantas A
+    realmente precisam de uma leitura detalhada.
+
+    Isso evita abrir A1-A6 individualmente em toda execução e mantém o monitor
+    bem mais leve e estável.
+    """
+    driver = get_browser()
+    url = f"{BASE_URL}/?_monitor_ts={int(time.time() * 1000)}"
+
+    try:
+        driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+    except Exception:
+        pass
+
+    try:
+        driver.get(url)
+    except TimeoutException as exc:
+        print(
+            "Página geral atingiu timeout; vou tentar usar o DOM já carregado: "
+            f"{clean_error(exc)}"
+        )
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
+
+    WebDriverWait(driver, 10).until(
+        lambda d: len(d.find_elements(By.TAG_NAME, "body")) > 0
+    )
+
+    best_cards = {}
+    previous_signature = None
+    stable_rounds = 0
+
+    for round_no in range(12):
+        body_text = driver.find_element(By.TAG_NAME, "body").text or ""
+        cards = parse_a_cards(body_text)
+
+        if len(cards) > len(best_cards):
+            best_cards = cards
+
+        signature = tuple(
+            sorted((k, v.get("price")) for k, v in cards.items())
+        )
+
+        if len(cards) == len(A_PLANS):
+            if signature == previous_signature:
+                stable_rounds += 1
+            else:
+                stable_rounds = 0
+
+            if round_no >= 2 and stable_rounds >= 1:
+                return cards
+
+        previous_signature = signature
+        time.sleep(1)
+
+    if len(best_cards) == len(A_PLANS):
+        return best_cards
+
+    missing = sorted(set(A_PLANS) - set(best_cards))
+    raise RuntimeError(
+        "A página geral abriu, mas não consegui validar todos os cards A1-A6. "
+        f"Faltaram: {', '.join(missing) if missing else 'desconhecido'}"
+    )
+
+
+def fetch_a_monitor_units(old_units):
+    """
+    Para o filtro de 1 quarto, só abrimos páginas individuais quando:
+    1) o card geral mostra preço abaixo de $1.800; ou
+    2) a planta tinha uma unidade abaixo de $1.800 no estado anterior,
+       para conseguirmos detectar corretamente aumento/saída do limite.
+    """
+    cards = fetch_a_index_cards()
+
+    candidate_plans = {
+        plan
+        for plan, card in cards.items()
+        if card.get("price") is not None and card["price"] < A_MAX_RENT
+    }
+
+    previous_qualifying_plans = {
+        unit.get("plan")
+        for unit in old_units.values()
+        if unit.get("plan") in A_PLANS
+        and int(unit.get("price", A_MAX_RENT)) < A_MAX_RENT
+    }
+
+    detail_plans = sorted(candidate_plans | previous_qualifying_plans)
+
+    if not detail_plans:
+        print(
+            f"A1-A6: nenhum card abaixo de {money(A_MAX_RENT)}; "
+            "não foi necessário abrir as 6 páginas individualmente."
+        )
+        return {}
+
+    units = {}
+    for plan in detail_plans:
+        units.update(fetch_floorplan(plan))
+
+    return units
+
+def unit_qualifies(unit):
+    plan = unit.get("plan", "")
+    price = int(unit.get("price", 10**9))
+
+    if plan in A_PLANS:
+        return price < A_MAX_RENT
+
+    if plan in FLOORPLANS:
+        return price <= MAX_RENT
+
+    return False
+
+
 def qualifying(units):
-    return {k: v for k, v in units.items() if v["price"] <= MAX_RENT}
+    return {k: v for k, v in units.items() if unit_qualifies(v)}
 
 
 def is_priority(unit):
@@ -415,25 +563,65 @@ def unit_line(unit):
 
 def current_summary(units):
     q = qualifying(units)
-    if not q:
-        return f"Nenhuma B1/B2 até {money(MAX_RENT)} neste momento."
 
-    ordered = sorted(q.values(), key=lambda x: (x["plan"], x["floor"], int(x["unit"])))
-    b1 = sum(1 for u in ordered if u["plan"] == "B1")
-    b2 = sum(1 for u in ordered if u["plan"] == "B2")
-    return (
-        f"Unidades até {money(MAX_RENT)}: B1={b1} | B2={b2}\n"
-        + "\n".join(unit_line(u) for u in ordered)
+    b_units = sorted(
+        [u for u in q.values() if u["plan"] in FLOORPLANS],
+        key=lambda x: (x["plan"], x["floor"], int(x["unit"])),
     )
+    a_units = sorted(
+        [u for u in q.values() if u["plan"] in A_PLANS],
+        key=lambda x: (x["plan"], x["floor"], int(x["unit"])),
+    )
+
+    b1 = sum(1 for u in b_units if u["plan"] == "B1")
+    b2 = sum(1 for u in b_units if u["plan"] == "B2")
+
+    if b_units:
+        b_section = (
+            f"🏠 2 QUARTOS | B1/B2 | até {money(MAX_RENT)}\n"
+            f"B1={b1} | B2={b2}\n"
+            + "\n".join(unit_line(u) for u in b_units)
+        )
+    else:
+        b_section = (
+            f"🏠 2 QUARTOS | B1/B2 | até {money(MAX_RENT)}\n"
+            "Nenhuma unidade no filtro neste momento."
+        )
+
+    if a_units:
+        counts = []
+        for plan in A_PLANS:
+            count = sum(1 for u in a_units if u["plan"] == plan)
+            if count:
+                counts.append(f"{plan}={count}")
+
+        a_section = (
+            f"🛏️ 1 QUARTO | A1-A6 | menos de {money(A_MAX_RENT)}\n"
+            + (" | ".join(counts) + "\n" if counts else "")
+            + "\n".join(unit_line(u) for u in a_units)
+        )
+    else:
+        a_section = (
+            f"🛏️ 1 QUARTO | A1-A6 | menos de {money(A_MAX_RENT)}\n"
+            "Nenhuma unidade no filtro neste momento."
+        )
+
+    return b_section + "\n\n" + a_section
+
+
+def event_group(unit):
+    return "A" if unit.get("plan") in A_PLANS else "B"
 
 
 def detect_changes(old_units, new_units):
-    events = []
+    events = {"B": [], "A": []}
     old_q = qualifying(old_units)
     new_q = qualifying(new_units)
 
     for key in sorted(set(new_q) - set(old_q)):
         new = new_q[key]
+        group = event_group(new)
+
         if is_priority(new):
             heading = "🔥🔥 PRIORIDADE: B2 NO 5º ANDAR"
         elif key in old_units:
@@ -442,32 +630,45 @@ def detect_changes(old_units, new_units):
             heading = "🏠 NOVA UNIDADE NO SEU FILTRO"
 
         if key in old_units:
-            events.append(
+            events[group].append(
                 f"{heading}\n{unit_line(new)}\nAntes: {money(old_units[key]['price'])}"
             )
         else:
-            events.append(f"{heading}\n{unit_line(new)}")
+            events[group].append(f"{heading}\n{unit_line(new)}")
 
     for key in sorted(set(old_q) - set(new_q)):
         old = old_q[key]
+        group = event_group(old)
+
         if key in new_units:
             new = new_units[key]
-            events.append(
+            limit_text = (
+                f"menos de {money(A_MAX_RENT)}"
+                if old.get("plan") in A_PLANS
+                else f"até {money(MAX_RENT)}"
+            )
+            events[group].append(
                 "⬆️ SAIU DO SEU LIMITE\n"
                 f"{old['plan']} #{old['unit']} | {old['floor']}º andar\n"
                 f"Antes: {money(old['price'])} | Agora: {money(new['price'])}\n"
+                f"Filtro: {limit_text}\n"
                 f"Disponibilidade atual: {new['availability']}"
             )
         else:
-            events.append(f"❌ NÃO APARECE MAIS COMO DISPONÍVEL\n{unit_line(old)}")
+            events[group].append(
+                f"❌ NÃO APARECE MAIS COMO DISPONÍVEL\n{unit_line(old)}"
+            )
 
     for key in sorted(set(old_q) & set(new_q)):
         old, new = old_q[key], new_q[key]
         changes = []
+
         if old["price"] != new["price"]:
             changes.append(f"Preço: {money(old['price'])} → {money(new['price'])}")
         if old["availability"] != new["availability"]:
-            changes.append(f"Disponibilidade: {old['availability']} → {new['availability']}")
+            changes.append(
+                f"Disponibilidade: {old['availability']} → {new['availability']}"
+            )
         if old["floor"] != new["floor"]:
             changes.append(f"Andar: {old['floor']} → {new['floor']}")
         if old["sqft"] != new["sqft"]:
@@ -479,10 +680,33 @@ def detect_changes(old_units, new_units):
                 if is_priority(new)
                 else "🔄 ALTERAÇÃO"
             )
-            events.append(f"{heading}\n{unit_line(new)}\n" + "\n".join(changes))
+            events[event_group(new)].append(
+                f"{heading}\n{unit_line(new)}\n" + "\n".join(changes)
+            )
 
     return events
 
+
+def has_events(events):
+    return bool(events.get("B") or events.get("A"))
+
+
+def format_event_sections(events):
+    sections = []
+
+    if events.get("B"):
+        sections.append(
+            f"🏠 2 QUARTOS | B1/B2 | até {money(MAX_RENT)}\n\n"
+            + "\n\n".join(events["B"])
+        )
+
+    if events.get("A"):
+        sections.append(
+            f"🛏️ 1 QUARTO | A1-A6 | menos de {money(A_MAX_RENT)}\n\n"
+            + "\n\n".join(events["A"])
+        )
+
+    return "\n\n".join(sections)
 
 def telegram_token():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -792,7 +1016,7 @@ def main():
         try:
             send_telegram(
                 "⏳ PEDIDO RECEBIDO\n\n"
-                "Vou consultar B1 e B2 agora. "
+                "Vou consultar os dois filtros agora. "
                 "O resultado chega assim que esta execução terminar."
             )
         except Exception as exc:
@@ -802,11 +1026,16 @@ def main():
     for plan in FLOORPLANS:
         new_units.update(fetch_floorplan(plan))
 
+    # 1 quarto: primeiro consulta a página geral e só abre A1-A6
+    # individualmente quando realmente houver chance de preço < $1.800.
+    new_units.update(fetch_a_monitor_units(old_units))
+
     if not old_units:
         message = (
             "✅ MONITOR BAINBRIDGE ATIVADO\n\n"
-            "Plantas: B1 e B2\n"
-            f"Preço máximo: {money(MAX_RENT)}\n"
+            "Filtros:\n"
+            f"• B1/B2: até {money(MAX_RENT)}\n"
+            f"• A1-A6: menos de {money(A_MAX_RENT)}\n"
             "Verificação: aproximadamente a cada 5 minutos\n\n"
             + current_summary(new_units)
         )
@@ -823,7 +1052,7 @@ def main():
         recovery = (
             "✅ MONITOR BAINBRIDGE VOLTOU AO NORMAL\n\n"
             f"Horário: {local_time_text()}\n"
-            "A consulta de B1 e B2 voltou a funcionar normalmente."
+            "A consulta dos dois filtros voltou a funcionar normalmente."
         )
         send_telegram(recovery)
         print(recovery)
@@ -841,17 +1070,17 @@ def main():
         old_state["updated_at_utc"] = utc_now().isoformat()
         write_state(old_state)
 
-    if events:
+    if has_events(events):
         message = (
             "🚨 BAINBRIDGE THE GRAND\n\n"
-            + "\n\n".join(events)
-            + "\n\n"
+            + format_event_sections(events)
+            + "\n\n📋 SITUAÇÃO ATUAL\n\n"
             + current_summary(new_units)
         )
         send_telegram(message)
         print(message)
 
-    if not events and not manual_request and not was_error_notified:
+    if not has_events(events) and not manual_request and not was_error_notified:
         if had_failed_check:
             print("Falha isolada anterior resolvida silenciosamente.")
         else:
