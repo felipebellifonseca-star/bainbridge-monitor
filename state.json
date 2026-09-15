@@ -1,9 +1,7 @@
 {
-  "last_error_message": "Falha ao consultar B1 com o navegador real após 2 tentativas. Últimos erros: Message: timeout: Timed out receiving message from renderer: -0.001\n  (Session info: chrome=152.0.7977.82)\nStacktrace:\n#0 0x559e328cc03a <unknown>\n#1 0x559e322344c9 <unknown>\n#2 0x559e3221bf5b <unknown>\n#3 0x559e3221bbd6 <unknown>\n#4 0x559e322197b8 <unknown>\n#5 0x559e3221a13f <unknown>\n#6 0x559e32229200 <unknown>\n#7 0x559e32243147 <unknown>\n#8 0x559e3224ab1b <unknown>\n#9 0x559e3221a899 <unknown>\n#10 0x559e32242ea7 <unknown>\n#11 0x559e322d2470 <unknown>\n#12 0x559e3227d83b <unknown>\n#13 0x559e3227e621 <unknown>\n#14 0x559e328905f0 <unknown>\n#15 0x559e3288ec6a <unknown>\n#16 0x559e328799f5 <unknown>\n#17 0x559e3288f92a <unknown>\n#18 0x559e32862d10 <unknown>\n#19 0x559e328b7158 <unknown>\n#20 0x559e328b72f5 <unknown>\n#21 0x559e328cabc3 <unknown>\n#22 0x7fbb8fa9cb84 <unknown>\n#23 0x7fbb8fb29d6c <unknown>\n | Message: timeou",
-  "last_error_utc": "2026-09-15T16:05:08.196856+00:00",
-  "last_success_utc": "2026-09-15T15:27:07.629314+00:00",
+  "last_success_utc": "2026-09-15T16:18:45.410991+00:00",
   "max_rent": 2700,
-  "monitor_status": "error",
+  "monitor_status": "ok",
   "telegram_update_id": 879278903,
   "units": {
     "B1-1119": {
@@ -160,5 +158,5 @@
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     }
   },
-  "updated_at_utc": "2026-09-15T16:05:08.196874+00:00"
+  "updated_at_utc": "2026-09-15T16:18:45.410991+00:00"
 }
