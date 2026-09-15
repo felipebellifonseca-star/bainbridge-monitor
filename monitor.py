@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -8,7 +9,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
-from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
 
 BASE_URL = "https://bainbridgegrand.com/floorplans"
 FLOORPLANS = ("B1", "B2")
@@ -69,14 +74,10 @@ def write_state(state):
     )
 
 
-def parse_floorplan(plan, body):
-    text = " ".join(BeautifulSoup(body, "html.parser").stripped_strings)
-    matches = list(UNIT_PATTERN.finditer(text))
-    if not matches:
-        raise RuntimeError(
-            f"Nenhuma unidade foi reconhecida em {plan}. "
-            "O site pode ter retornado uma página incompleta ou mudado de estrutura."
-        )
+def parse_floorplan_text(plan, text):
+    """Converte o TEXTO VISÍVEL do navegador em unidades."""
+    normalized = " ".join((text or "").split())
+    matches = list(UNIT_PATTERN.finditer(normalized))
 
     units = {}
     for match in matches:
@@ -91,89 +92,197 @@ def parse_floorplan(plan, body):
             "availability": " ".join(data["availability"].split()),
             "url": f"{BASE_URL}/{plan.lower()}/",
         }
+
     return units
+
+
+_DRIVER = None
+
+
+def get_browser():
+    """Abre um Chrome real em modo headless e o reutiliza para B1 e B2."""
+    global _DRIVER
+    if _DRIVER is not None:
+        return _DRIVER
+
+    chrome_binary = (
+        shutil.which("google-chrome")
+        or shutil.which("google-chrome-stable")
+        or shutil.which("chromium")
+        or shutil.which("chromium-browser")
+    )
+    chromedriver = shutil.which("chromedriver")
+
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1440,2200")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--disable-sync")
+    options.add_argument("--no-first-run")
+    options.add_argument("--incognito")
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/151.0.0.0 Safari/537.36"
+    )
+
+    if chrome_binary:
+        options.binary_location = chrome_binary
+
+    try:
+        if chromedriver:
+            driver = webdriver.Chrome(
+                service=Service(chromedriver),
+                options=options,
+            )
+        else:
+            # Selenium Manager tenta resolver o driver compatível.
+            driver = webdriver.Chrome(options=options)
+    except Exception as exc:
+        raise RuntimeError(
+            "Não consegui iniciar o Chrome do GitHub Actions. "
+            f"Erro: {exc}"
+        ) from exc
+
+    driver.set_page_load_timeout(45)
+    driver.set_script_timeout(20)
+
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
+        driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+    except Exception:
+        pass
+
+    _DRIVER = driver
+    return driver
+
+
+def close_browser():
+    global _DRIVER
+    if _DRIVER is not None:
+        try:
+            _DRIVER.quit()
+        except Exception:
+            pass
+        _DRIVER = None
+
+
+def rendered_body_text(driver, url, plan):
+    """
+    Abre a página como um usuário de verdade, espera JavaScript terminar e
+    devolve somente o texto VISÍVEL. Elementos ocultados pelo site não entram.
+    """
+    separator = "&" if "?" in url else "?"
+    fresh_url = f"{url}{separator}_monitor_ts={int(time.time() * 1000)}"
+
+    try:
+        driver.execute_cdp_cmd("Network.clearBrowserCache", {})
+    except Exception:
+        pass
+
+    driver.get(fresh_url)
+
+    WebDriverWait(driver, 20).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+
+    # Alguns componentes de disponibilidade carregam depois do evento load.
+    # Rolamos a página para disparar widgets lazy-load e esperamos o texto estabilizar.
+    try:
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    except Exception:
+        pass
+    time.sleep(2)
+
+    previous = None
+    stable_rounds = 0
+    best_text = ""
+
+    for _ in range(8):
+        body = driver.find_element(By.TAG_NAME, "body")
+        current = body.text or ""
+        if len(current) > len(best_text):
+            best_text = current
+
+        if current == previous and len(current) > 500:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+
+        if stable_rounds >= 2:
+            best_text = current
+            break
+
+        previous = current
+        time.sleep(1.5)
+
+    if len(best_text) < 500:
+        raise RuntimeError(
+            f"A página {plan} abriu, mas o conteúdo visível parece incompleto."
+        )
+
+    return best_text
 
 
 def fetch_floorplan(plan):
     """
-    Primeiro tenta o site oficial diretamente.
-    Se a rota do GitHub para o site estiver com timeout, usa o Jina Reader
-    como rota alternativa para buscar A MESMA página oficial.
+    Fonte principal: DOM VISÍVEL de um Chrome real, depois do JavaScript.
+
+    Isso é proposital: o HTML cru do Bainbridge pode continuar contendo uma
+    unidade antiga mesmo depois de a interface real já ter removido a unidade.
     """
+    driver = get_browser()
     slug = plan.lower()
-    target = f"https://bainbridgegrand.com/floorplans/{slug}/"
-    www_target = f"https://www.bainbridgegrand.com/floorplans/{slug}/"
+    urls = [
+        f"https://bainbridgegrand.com/floorplans/{slug}/",
+        f"https://www.bainbridgegrand.com/floorplans/{slug}/",
+    ]
 
     errors = []
 
-    direct_attempts = [
-        (target, (6, 18)),
-        (www_target, (6, 18)),
-    ]
-
-    for n, (url, timeout) in enumerate(direct_attempts, start=1):
+    for n, url in enumerate(urls, start=1):
         try:
-            print(f"Consultando {plan} direto: tentativa {n}/{len(direct_attempts)}")
-            response = requests.get(
-                url,
-                headers=HEADERS,
-                timeout=timeout,
-                allow_redirects=True,
+            print(f"Consultando {plan} no Chrome: tentativa {n}/{len(urls)}")
+            text = rendered_body_text(driver, url, plan)
+            units = parse_floorplan_text(plan, text)
+
+            # Se houver cards de unidades, usamos somente os cards VISÍVEIS.
+            if units:
+                print(
+                    f"{plan}: Chrome OK ({len(units)} unidades visíveis): "
+                    + ", ".join(sorted(units))
+                )
+                return units
+
+            # Zero unidades pode ser legítimo, mas só aceitamos isso quando a
+            # própria página terminou de carregar e mostra o shell do floorplan.
+            normalized = " ".join(text.split()).lower()
+            loaded_markers = [
+                plan.lower(),
+                "floorplans are artist",
+            ]
+            if all(marker in normalized for marker in loaded_markers):
+                print(f"{plan}: Chrome OK, nenhuma unidade visível disponível.")
+                return {}
+
+            raise RuntimeError(
+                f"Chrome abriu {plan}, mas não consegui validar o conteúdo final."
             )
-            response.raise_for_status()
-            units = parse_floorplan(plan, response.text)
-            print(f"{plan}: OK direto na tentativa {n} ({len(units)} unidades)")
-            return units
-        except Exception as exc:
-            errors.append(f"direto {n}: {exc}")
-            print(f"{plan}: tentativa direta {n} falhou: {exc}", file=sys.stderr)
-            time.sleep(1)
-
-    # Fallback real: outra infraestrutura faz a leitura da mesma página oficial.
-    # X-No-Cache força uma nova busca para reduzir risco de conteúdo antigo.
-    reader_url = f"https://r.jina.ai/{target}"
-    reader_attempts = [
-        {
-            "Accept": "text/plain",
-            "X-No-Cache": "true",
-        },
-        {
-            "Accept": "text/plain",
-            "X-No-Cache": "true",
-            "X-Engine": "browser",
-        },
-    ]
-
-    for n, reader_headers in enumerate(reader_attempts, start=1):
-        try:
-            print(f"Consultando {plan} via fallback Jina: tentativa {n}/{len(reader_attempts)}")
-            response = requests.get(
-                reader_url,
-                headers=reader_headers,
-                timeout=(8, 35),
-            )
-            response.raise_for_status()
-
-            units = parse_floorplan(plan, response.text)
-
-            print(
-                f"{plan}: OK via fallback Jina na tentativa {n} "
-                f"({len(units)} unidades)"
-            )
-            return units
 
         except Exception as exc:
-            errors.append(f"fallback {n}: {exc}")
-            print(
-                f"{plan}: fallback Jina {n} falhou: {exc}",
-                file=sys.stderr,
-            )
+            errors.append(str(exc))
+            print(f"{plan}: Chrome tentativa {n} falhou: {exc}", file=sys.stderr)
             time.sleep(2)
 
     raise RuntimeError(
-        f"Falha ao consultar {plan}. "
-        "Tentei o site oficial diretamente e também uma rota alternativa. "
-        f"Últimos erros: {' | '.join(errors[-4:])}"
+        f"Falha ao consultar {plan} com o navegador real após {len(urls)} tentativas. "
+        f"Últimos erros: {' | '.join(errors[-2:])}"
     )
 
 
@@ -590,3 +699,5 @@ if __name__ == "__main__":
         print(f"ERRO: {exc}", file=sys.stderr)
         record_failure(exc)
         raise
+    finally:
+        close_browser()
