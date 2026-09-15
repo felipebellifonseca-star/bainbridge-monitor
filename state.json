@@ -1,9 +1,7 @@
 {
-  "failure_count": 1,
-  "last_error_message": "Falha ao consultar B1: Nenhuma unidade foi reconhecida em B1. O site pode ter mudado de estrutura.",
-  "last_error_utc": "2026-09-15T07:14:26.134073+00:00",
-  "last_heartbeat_utc": "2026-09-15T06:11:34.989142+00:00",
-  "last_success_utc": "2026-09-15T07:00:05.296935+00:00",
+  "failure_count": 0,
+  "last_heartbeat_utc": "2026-09-15T07:29:23.652658+00:00",
+  "last_success_utc": "2026-09-15T07:29:23.652658+00:00",
   "max_rent": 2700,
   "monitor_status": "ok",
   "telegram_update_id": 879278898,
@@ -162,5 +160,5 @@
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     }
   },
-  "updated_at_utc": "2026-09-15T07:14:26.134089+00:00"
+  "updated_at_utc": "2026-09-15T07:29:23.652658+00:00"
 }
