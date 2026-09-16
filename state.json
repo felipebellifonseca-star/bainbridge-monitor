@@ -1,8 +1,8 @@
 {
-  "a_consecutive_failures": 22,
+  "a_consecutive_failures": 23,
   "a_error_notified": true,
   "a_last_error_message": "A página geral abriu, mas não consegui validar todos os cards A1-A6. Faltaram: A1, A2, A3, A4, A5, A6",
-  "a_last_error_utc": "2026-09-16T03:24:24.643926+00:00",
+  "a_last_error_utc": "2026-09-16T03:35:38.352339+00:00",
   "consecutive_failures": 0,
   "error_notified": false,
   "last_success_utc": "2026-09-16T02:59:35.843133+00:00",
@@ -173,5 +173,5 @@
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     }
   },
-  "updated_at_utc": "2026-09-16T03:24:24.643957+00:00"
+  "updated_at_utc": "2026-09-16T03:35:38.352370+00:00"
 }
