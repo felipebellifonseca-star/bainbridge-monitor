@@ -1,6 +1,7 @@
 {
   "a_consecutive_failures": 0,
   "a_error_notified": false,
+  "a_failed_plans": [],
   "a_max_rent": 1800,
   "consecutive_failures": 0,
   "error_notified": false,
@@ -172,5 +173,5 @@
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     }
   },
-  "updated_at_utc": "2026-09-17T02:05:51.279203+00:00"
+  "updated_at_utc": "2026-09-17T02:21:29.180808+00:00"
 }
