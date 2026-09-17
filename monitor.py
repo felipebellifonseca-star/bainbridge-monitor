@@ -7,18 +7,21 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from html.parser import HTMLParser
 
 import requests
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 
 BASE_URL = "https://bainbridgegrand.com/floorplans"
-FLOORPLANS = ("B1", "B2")
+B_PLANS = ("B1", "B2")
 A_PLANS = ("A1", "A2", "A3", "A4", "A5", "A6")
+ALL_PLANS = B_PLANS + A_PLANS
+
 MAX_RENT = int(os.getenv("MAX_RENT", "2700"))
 A_MAX_RENT = int(os.getenv("A_MAX_RENT", "1800"))
 STATE_FILE = Path("state.json")
@@ -47,15 +50,9 @@ UNIT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-A_CARD_PATTERN = re.compile(
-    r"(?:View\s+Floorplan\s+)?(?P<plan>A[1-6])\s*"
-    r"1\s*bed\s*1\s*bath\s*"
-    r"(?P<sqft>[\d,]+)\s*sq\.?\s*ft\.?\s*"
-    r"(?:(?:Starting\s+at\s+\$(?P<price>[\d,]+))|Contact\s+Us)",
-    re.IGNORECASE,
-)
-
 MANUAL_COMMANDS = {"/check", "/status", "/buscar", "/verificar", "/teste"}
+
+_DRIVER = None
 
 
 def utc_now():
@@ -67,7 +64,15 @@ def local_time_text():
 
 
 def money(value):
-    return f"${value:,.0f}"
+    return f"${int(value):,.0f}"
+
+
+def clean_error(exc):
+    text = str(exc or "").strip()
+    if not text:
+        return exc.__class__.__name__
+    first = text.splitlines()[0].strip() or exc.__class__.__name__
+    return first[:350]
 
 
 def load_state():
@@ -87,12 +92,10 @@ def write_state(state):
 
 
 def parse_floorplan_text(plan, text):
-    """Converte o TEXTO VISÍVEL do navegador em unidades."""
     normalized = " ".join((text or "").split())
-    matches = list(UNIT_PATTERN.finditer(normalized))
-
     units = {}
-    for match in matches:
+
+    for match in UNIT_PATTERN.finditer(normalized):
         data = match.groupdict()
         number = data["unit"]
         units[f"{plan}-{number}"] = {
@@ -108,30 +111,73 @@ def parse_floorplan_text(plan, text):
     return units
 
 
-_DRIVER = None
+def page_is_valid_zero_availability(plan, text):
+    """Aceita zero unidades somente quando a página específica diz Contact Us."""
+    normalized = " ".join((text or "").split())
+    lower = normalized.lower()
+    plan_present = re.search(rf"\b{re.escape(plan.lower())}\b", lower) is not None
+    disclaimer_present = "floorplans are artist" in lower
+    contact_us = "contact us" in lower
+    check_availability = "check availability" in lower
+    return plan_present and disclaimer_present and contact_us and not check_availability
 
 
-def clean_error(exc):
-    """Deixa os erros do Chrome curtos e úteis para o Telegram."""
-    text = str(exc or "").strip()
-    if not text:
-        return exc.__class__.__name__
+class _VisibleTextParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.hidden_depth = 0
 
-    first_line = text.splitlines()[0].strip()
-    if not first_line:
-        first_line = exc.__class__.__name__
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in {"script", "style", "noscript", "svg"}:
+            self.hidden_depth += 1
 
-    # Remove pilhas gigantes do Chrome; o log do GitHub continua tendo detalhes.
-    return first_line[:350]
+    def handle_endtag(self, tag):
+        if tag.lower() in {"script", "style", "noscript", "svg"} and self.hidden_depth:
+            self.hidden_depth -= 1
+
+    def handle_data(self, data):
+        if self.hidden_depth == 0 and data and data.strip():
+            self.parts.append(data.strip())
+
+
+def html_visible_text(html):
+    parser = _VisibleTextParser()
+    parser.feed(html or "")
+    parser.close()
+    return " ".join(parser.parts)
+
+
+def fetch_floorplan_http(plan):
+    """Primeira fonte: HTML direto. É rápido e hoje o Bainbridge já entrega as unidades no HTML."""
+    url = f"{BASE_URL}/{plan.lower()}/"
+    response = requests.get(
+        url,
+        params={"_monitor_ts": int(time.time() * 1000)},
+        headers=HEADERS,
+        timeout=20,
+    )
+    response.raise_for_status()
+    text = html_visible_text(response.text)
+    units = parse_floorplan_text(plan, text)
+
+    if units:
+        print(
+            f"{plan}: HTTP OK ({len(units)} unidades): "
+            + ", ".join(sorted(units))
+        )
+        return units
+
+    if page_is_valid_zero_availability(plan, text):
+        print(f"{plan}: HTTP OK, sem unidades disponíveis (Contact Us).")
+        return {}
+
+    raise RuntimeError(
+        f"HTML de {plan} abriu, mas não trouxe uma disponibilidade validável."
+    )
 
 
 def get_browser():
-    """
-    Abre Chrome headless de forma mais tolerante.
-
-    page_load_strategy='eager' é importante aqui: não esperamos imagens,
-    trackers e outros recursos terminarem para considerar a navegação pronta.
-    """
     global _DRIVER
     if _DRIVER is not None:
         return _DRIVER
@@ -146,7 +192,6 @@ def get_browser():
 
     options = Options()
     options.page_load_strategy = "eager"
-
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
@@ -165,8 +210,6 @@ def get_browser():
         "--disable-features=Translate,BackForwardCache,MediaRouter,"
         "OptimizationHints,AutofillServerCommunication"
     )
-
-    # Imagens são irrelevantes para o monitor e só deixam a página mais pesada.
     options.add_experimental_option(
         "prefs",
         {
@@ -181,10 +224,7 @@ def get_browser():
 
     try:
         if chromedriver:
-            driver = webdriver.Chrome(
-                service=Service(chromedriver),
-                options=options,
-            )
+            driver = webdriver.Chrome(service=Service(chromedriver), options=options)
         else:
             driver = webdriver.Chrome(options=options)
     except Exception as exc:
@@ -193,32 +233,19 @@ def get_browser():
             f"Erro: {clean_error(exc)}"
         ) from exc
 
-    # Timeout curto: se os recursos secundários travarem, ainda tentamos ler
-    # o DOM que já foi carregado em vez de esperar quase um minuto.
     driver.set_page_load_timeout(22)
     driver.set_script_timeout(15)
 
     try:
         driver.execute_cdp_cmd("Network.enable", {})
-        driver.execute_cdp_cmd(
-            "Network.setCacheDisabled",
-            {"cacheDisabled": True},
-        )
+        driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
         driver.execute_cdp_cmd("Network.clearBrowserCache", {})
         driver.execute_cdp_cmd(
             "Network.setBlockedURLs",
             {
                 "urls": [
-                    "*.png",
-                    "*.jpg",
-                    "*.jpeg",
-                    "*.gif",
-                    "*.webp",
-                    "*.avif",
-                    "*.mp4",
-                    "*.webm",
-                    "*.woff",
-                    "*.woff2",
+                    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.avif",
+                    "*.mp4", "*.webm", "*.woff", "*.woff2",
                 ]
             },
         )
@@ -239,199 +266,10 @@ def close_browser():
         _DRIVER = None
 
 
-def rendered_body_text(driver, url, plan):
-    """
-    Lê o texto VISÍVEL do site depois do JavaScript.
-
-    Não exigimos document.readyState='complete', porque analytics, imagens ou
-    widgets externos podem segurar o evento load e causar timeout do renderer
-    mesmo quando a disponibilidade já está visível na tela.
-    """
-    separator = "&" if "?" in url else "?"
-    fresh_url = f"{url}{separator}_monitor_ts={int(time.time() * 1000)}"
-
-    try:
-        driver.execute_cdp_cmd("Network.clearBrowserCache", {})
-    except Exception:
-        pass
-
-    try:
-        driver.get(fresh_url)
-    except TimeoutException as exc:
-        # O Chrome pode estourar o timeout esperando recursos secundários.
-        # Se o DOM já existe, paramos o restante do carregamento e continuamos.
-        print(
-            f"{plan}: navegação atingiu timeout, vou tentar usar o DOM já carregado: "
-            f"{clean_error(exc)}"
-        )
-        try:
-            driver.execute_script("window.stop();")
-        except Exception:
-            pass
-
-    # Precisamos apenas do body, não de todos os recursos da página.
-    WebDriverWait(driver, 10).until(
-        lambda d: len(d.find_elements(By.TAG_NAME, "body")) > 0
-    )
-
-    best_text = ""
-    previous_units = None
-    stable_unit_rounds = 0
-    shell_stable_rounds = 0
-    previous_text = None
-
-    # Dá tempo para o componente de disponibilidade buscar os dados via JS.
-    for round_no in range(18):
-        try:
-            if round_no in {1, 4, 8}:
-                driver.execute_script(
-                    "window.scrollTo(0, document.body.scrollHeight);"
-                )
-            elif round_no in {3, 7}:
-                driver.execute_script("window.scrollTo(0, 0);")
-        except Exception:
-            pass
-
-        body = driver.find_element(By.TAG_NAME, "body")
-        current = body.text or ""
-
-        if len(current) > len(best_text):
-            best_text = current
-
-        units = parse_floorplan_text(plan, current)
-        unit_keys = tuple(sorted(units))
-
-        # Se as unidades visíveis ficam iguais em 2 leituras consecutivas,
-        # depois de alguns segundos de carregamento, consideramos o DOM estável.
-        if units:
-            if unit_keys == previous_units:
-                stable_unit_rounds += 1
-            else:
-                stable_unit_rounds = 0
-
-            previous_units = unit_keys
-
-            if round_no >= 3 and stable_unit_rounds >= 2:
-                return current
-
-        # Caso realmente existam zero unidades, validamos o shell da página
-        # antes de aceitar o resultado vazio.
-        normalized = " ".join(current.split()).lower()
-        shell_loaded = (
-            plan.lower() in normalized
-            and "floorplans are artist" in normalized
-        )
-
-        if not units and shell_loaded:
-            if current == previous_text:
-                shell_stable_rounds += 1
-            else:
-                shell_stable_rounds = 0
-
-            # Esperamos mais tempo para não confundir "ainda carregando"
-            # com "nenhuma unidade disponível".
-            if round_no >= 8 and shell_stable_rounds >= 2:
-                return current
-
-        previous_text = current
-        time.sleep(1)
-
-    # Mesmo sem estabilizar formalmente, se vimos unidades válidas durante a
-    # espera, usamos a melhor versão visível encontrada.
-    if parse_floorplan_text(plan, best_text):
-        return best_text
-
-    raise RuntimeError(
-        f"A página {plan} abriu, mas a disponibilidade não terminou de carregar."
-    )
-
-
-def fetch_floorplan(plan):
-    """
-    Fonte principal: texto VISÍVEL de um Chrome real.
-
-    Fazemos UMA tentativa por execução do GitHub. Se ela falhar, a próxima
-    execução usa uma VM/região/IP novos. Na prática isso é mais útil do que
-    repetir duas vezes dentro do mesmo runner que já está com a rota ruim.
-    """
-    slug = plan.lower()
-    url = f"https://bainbridgegrand.com/floorplans/{slug}/"
-
-    try:
-        driver = get_browser()
-
-        print(f"Consultando {plan} no Chrome: tentativa única desta execução")
-
-        text = rendered_body_text(driver, url, plan)
-        units = parse_floorplan_text(plan, text)
-
-        if units:
-            print(
-                f"{plan}: Chrome OK ({len(units)} unidades visíveis): "
-                + ", ".join(sorted(units))
-            )
-            return units
-
-        normalized = " ".join(text.split()).lower()
-        if (
-            plan.lower() in normalized
-            and "floorplans are artist" in normalized
-        ):
-            print(
-                f"{plan}: Chrome OK, "
-                "nenhuma unidade visível disponível."
-            )
-            return {}
-
-        raise RuntimeError(
-            f"Chrome abriu {plan}, mas não consegui validar o conteúdo final."
-        )
-
-    except Exception as exc:
-        short = clean_error(exc)
-
-        print(
-            f"{plan}: tentativa desta execução falhou: {exc}",
-            file=sys.stderr,
-        )
-
-        # Não reaproveitamos um renderer que tenha travado.
-        close_browser()
-
-        raise RuntimeError(
-            f"Falha ao consultar {plan} nesta execução: {short}"
-        ) from exc
-
-
-
-def parse_a_cards(text):
-    """Lê os cards A1-A6 da página geral de floorplans."""
-    normalized = " ".join((text or "").split())
-    cards = {}
-
-    for match in A_CARD_PATTERN.finditer(normalized):
-        data = match.groupdict()
-        plan = data["plan"].upper()
-        price = data.get("price")
-        cards[plan] = {
-            "plan": plan,
-            "sqft": int(data["sqft"].replace(",", "")),
-            "price": int(price.replace(",", "")) if price else None,
-        }
-
-    return cards
-
-
-def fetch_a_index_cards():
-    """
-    Consulta a página geral uma única vez para descobrir quais plantas A
-    realmente precisam de uma leitura detalhada.
-
-    Isso evita abrir A1-A6 individualmente em toda execução e mantém o monitor
-    bem mais leve e estável.
-    """
+def fetch_floorplan_browser(plan):
+    """Fallback: Chrome real, usado apenas se o HTML direto não vier completo."""
     driver = get_browser()
-    url = f"{BASE_URL}/?_monitor_ts={int(time.time() * 1000)}"
+    url = f"{BASE_URL}/{plan.lower()}/?_monitor_ts={int(time.time() * 1000)}"
 
     try:
         driver.execute_cdp_cmd("Network.clearBrowserCache", {})
@@ -442,8 +280,7 @@ def fetch_a_index_cards():
         driver.get(url)
     except TimeoutException as exc:
         print(
-            "Página geral atingiu timeout; vou tentar usar o DOM já carregado: "
-            f"{clean_error(exc)}"
+            f"{plan}: Chrome atingiu timeout; usando o DOM já carregado: {clean_error(exc)}"
         )
         try:
             driver.execute_script("window.stop();")
@@ -454,100 +291,97 @@ def fetch_a_index_cards():
         lambda d: len(d.find_elements(By.TAG_NAME, "body")) > 0
     )
 
-    best_cards = {}
+    best_text = ""
+    best_units = {}
     previous_signature = None
     stable_rounds = 0
+    zero_valid_rounds = 0
 
+    # Não encerramos depois de 2-3 segundos. Algumas unidades aparecem mais tarde.
+    # Esperamos pelo menos ~8 s antes de aceitar estabilidade.
     for round_no in range(12):
         try:
-            if round_no in {1, 3, 5, 8}:
-                driver.execute_script(
-                    "window.scrollTo(0, document.body.scrollHeight);"
-                )
-            elif round_no in {2, 6}:
+            if round_no in {1, 4, 7, 10}:
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            elif round_no in {3, 6, 9}:
                 driver.execute_script("window.scrollTo(0, 0);")
         except Exception:
             pass
 
-        body_text = driver.find_element(By.TAG_NAME, "body").text or ""
-        cards = parse_a_cards(body_text)
+        current = driver.find_element(By.TAG_NAME, "body").text or ""
+        units = parse_floorplan_text(plan, current)
 
-        if len(cards) > len(best_cards):
-            best_cards = cards
+        if len(units) > len(best_units) or (len(units) == len(best_units) and len(current) > len(best_text)):
+            best_units = units
+            best_text = current
 
-        signature = tuple(
-            sorted((k, v.get("price")) for k, v in cards.items())
-        )
-
-        if len(cards) == len(A_PLANS):
+        signature = tuple(sorted(units))
+        if units:
             if signature == previous_signature:
                 stable_rounds += 1
             else:
                 stable_rounds = 0
+            previous_signature = signature
 
-            if round_no >= 2 and stable_rounds >= 1:
-                return cards
+            if round_no >= 8 and stable_rounds >= 2:
+                print(
+                    f"{plan}: Chrome OK ({len(best_units)} unidades): "
+                    + ", ".join(sorted(best_units))
+                )
+                return best_units
+        else:
+            if page_is_valid_zero_availability(plan, current):
+                zero_valid_rounds += 1
+                if round_no >= 6 and zero_valid_rounds >= 2:
+                    print(f"{plan}: Chrome OK, sem unidades disponíveis (Contact Us).")
+                    return {}
+            else:
+                zero_valid_rounds = 0
 
-        previous_signature = signature
         time.sleep(1)
 
-    if len(best_cards) == len(A_PLANS):
-        return best_cards
+    if best_units:
+        print(
+            f"{plan}: Chrome OK ao final ({len(best_units)} unidades): "
+            + ", ".join(sorted(best_units))
+        )
+        return best_units
 
-    missing = sorted(set(A_PLANS) - set(best_cards))
+    if page_is_valid_zero_availability(plan, best_text):
+        print(f"{plan}: Chrome OK ao final, sem unidades disponíveis.")
+        return {}
+
     raise RuntimeError(
-        "A página geral abriu, mas não consegui validar todos os cards A1-A6. "
-        f"Faltaram: {', '.join(missing) if missing else 'desconhecido'}"
+        f"Chrome abriu {plan}, mas a disponibilidade não ficou validável."
     )
 
 
-def fetch_a_monitor_units(old_units):
-    """
-    Para o filtro de 1 quarto, só abrimos páginas individuais quando:
-    1) o card geral mostra preço abaixo de $1.800; ou
-    2) a planta tinha uma unidade abaixo de $1.800 no estado anterior,
-       para conseguirmos detectar corretamente aumento/saída do limite.
-    """
-    cards = fetch_a_index_cards()
-
-    candidate_plans = {
-        plan
-        for plan, card in cards.items()
-        if card.get("price") is not None and card["price"] < A_MAX_RENT
-    }
-
-    previous_qualifying_plans = {
-        unit.get("plan")
-        for unit in old_units.values()
-        if unit.get("plan") in A_PLANS
-        and int(unit.get("price", A_MAX_RENT)) < A_MAX_RENT
-    }
-
-    detail_plans = sorted(candidate_plans | previous_qualifying_plans)
-
-    if not detail_plans:
+def fetch_floorplan(plan):
+    """HTTP primeiro; Chrome como fallback. Só falha se as duas fontes falharem."""
+    try:
+        return fetch_floorplan_http(plan)
+    except Exception as http_exc:
         print(
-            f"A1-A6: nenhum card abaixo de {money(A_MAX_RENT)}; "
-            "não foi necessário abrir as 6 páginas individualmente."
+            f"{plan}: HTTP não foi suficiente ({clean_error(http_exc)}). Tentando Chrome...",
+            file=sys.stderr,
         )
-        return {}
 
-    units = {}
-    for plan in detail_plans:
-        units.update(fetch_floorplan(plan))
+    try:
+        return fetch_floorplan_browser(plan)
+    except Exception as browser_exc:
+        close_browser()
+        raise RuntimeError(
+            f"Falha ao consultar {plan} por HTTP e Chrome: {clean_error(browser_exc)}"
+        ) from browser_exc
 
-    return units
 
 def unit_qualifies(unit):
     plan = unit.get("plan", "")
     price = int(unit.get("price", 10**9))
-
     if plan in A_PLANS:
         return price < A_MAX_RENT
-
-    if plan in FLOORPLANS:
+    if plan in B_PLANS:
         return price <= MAX_RENT
-
     return False
 
 
@@ -571,11 +405,10 @@ def unit_line(unit):
     )
 
 
-def current_summary(units):
+def current_summary(units, a_available=True):
     q = qualifying(units)
-
     b_units = sorted(
-        [u for u in q.values() if u["plan"] in FLOORPLANS],
+        [u for u in q.values() if u["plan"] in B_PLANS],
         key=lambda x: (x["plan"], x["floor"], int(x["unit"])),
     )
     a_units = sorted(
@@ -604,7 +437,6 @@ def current_summary(units):
             count = sum(1 for u in a_units if u["plan"] == plan)
             if count:
                 counts.append(f"{plan}={count}")
-
         a_section = (
             f"🛏️ 1 QUARTO | A1-A6 | menos de {money(A_MAX_RENT)}\n"
             + (" | ".join(counts) + "\n" if counts else "")
@@ -614,6 +446,12 @@ def current_summary(units):
         a_section = (
             f"🛏️ 1 QUARTO | A1-A6 | menos de {money(A_MAX_RENT)}\n"
             "Nenhuma unidade no filtro neste momento."
+        )
+
+    if not a_available:
+        a_section += (
+            "\n⚠️ Uma ou mais plantas A não puderam ser atualizadas nesta execução; "
+            "o monitor preservou o último estado conhecido dessas plantas."
         )
 
     return b_section + "\n\n" + a_section
@@ -631,7 +469,6 @@ def detect_changes(old_units, new_units):
     for key in sorted(set(new_q) - set(old_q)):
         new = new_q[key]
         group = event_group(new)
-
         if is_priority(new):
             heading = "🔥🔥 PRIORIDADE: B2 NO 5º ANDAR"
         elif key in old_units:
@@ -649,7 +486,6 @@ def detect_changes(old_units, new_units):
     for key in sorted(set(old_q) - set(new_q)):
         old = old_q[key]
         group = event_group(old)
-
         if key in new_units:
             new = new_units[key]
             limit_text = (
@@ -672,13 +508,10 @@ def detect_changes(old_units, new_units):
     for key in sorted(set(old_q) & set(new_q)):
         old, new = old_q[key], new_q[key]
         changes = []
-
         if old["price"] != new["price"]:
             changes.append(f"Preço: {money(old['price'])} → {money(new['price'])}")
         if old["availability"] != new["availability"]:
-            changes.append(
-                f"Disponibilidade: {old['availability']} → {new['availability']}"
-            )
+            changes.append(f"Disponibilidade: {old['availability']} → {new['availability']}")
         if old["floor"] != new["floor"]:
             changes.append(f"Andar: {old['floor']} → {new['floor']}")
         if old["sqft"] != new["sqft"]:
@@ -703,20 +536,18 @@ def has_events(events):
 
 def format_event_sections(events):
     sections = []
-
     if events.get("B"):
         sections.append(
             f"🏠 2 QUARTOS | B1/B2 | até {money(MAX_RENT)}\n\n"
             + "\n\n".join(events["B"])
         )
-
     if events.get("A"):
         sections.append(
             f"🛏️ 1 QUARTO | A1-A6 | menos de {money(A_MAX_RENT)}\n\n"
             + "\n\n".join(events["A"])
         )
-
     return "\n\n".join(sections)
+
 
 def telegram_token():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -766,7 +597,11 @@ def telegram_keyboard():
 
 
 def send_to_chat(chat_id, text, buttons=True):
-    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
     if buttons:
         payload["reply_markup"] = telegram_keyboard()
 
@@ -778,7 +613,7 @@ def send_to_chat(chat_id, text, buttons=True):
     response.raise_for_status()
     data = response.json()
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram retornou erro: {data}")
+        raise RuntimeError("Telegram sendMessage retornou erro.")
 
 
 def send_telegram(text, include_chat_id=False):
@@ -832,6 +667,13 @@ def answer_callback(token, callback_id):
 
 
 def poll_telegram_requests(state):
+    """
+    Lê atualizações do Telegram.
+
+    Importante: qualquer callback_data='check_now' emitido por ESTE bot é aceito.
+    Não descartamos o clique por divergência silenciosa de chat_id. O resultado
+    continua sendo enviado somente ao TELEGRAM_CHAT_ID configurado.
+    """
     token = telegram_token()
     expected_chat_id = configured_chat_id(token)
     last_update_id = state.get("telegram_update_id")
@@ -848,10 +690,9 @@ def poll_telegram_requests(state):
 
         callback = update.get("callback_query")
         if callback:
-            message = callback.get("message") or {}
-            source_chat_id = str((message.get("chat") or {}).get("id", ""))
-            if source_chat_id == expected_chat_id and callback.get("data") == "check_now":
+            if callback.get("data") == "check_now":
                 manual_requested = True
+                print("Telegram: callback 'check_now' recebido e aceito.")
                 if callback.get("id"):
                     answer_callback(token, callback["id"])
             continue
@@ -873,6 +714,7 @@ def poll_telegram_requests(state):
 
         if source_chat_id == expected_chat_id and command in MANUAL_COMMANDS:
             manual_requested = True
+            print(f"Telegram: comando manual '{command}' recebido e aceito.")
 
     return manual_requested, newest_id
 
@@ -895,11 +737,8 @@ def save_telegram_offset(state, newest_update_id, manual_requested=False):
 
     return updated
 
+
 def legacy_error_was_notified(state):
-    """
-    Compatibilidade com o state.json antigo: antes não existia error_notified,
-    mas monitor_status='error' significava que o Telegram já tinha sido avisado.
-    """
     if "error_notified" in state:
         return bool(state.get("error_notified"))
     return state.get("monitor_status") == "error"
@@ -914,37 +753,25 @@ def save_success_state(units, previous_state):
         "consecutive_failures": 0,
         "error_notified": False,
         "max_rent": MAX_RENT,
+        "a_max_rent": A_MAX_RENT,
         "units": dict(sorted(units.items())),
     }
 
-    if previous_state.get("telegram_update_id") is not None:
-        payload["telegram_update_id"] = previous_state["telegram_update_id"]
-
-    if previous_state.get("manual_pending"):
-        payload["manual_pending"] = True
-
-    # Saúde do filtro A1-A6 é independente do monitor principal B1/B2.
-    payload["a_consecutive_failures"] = int(
-        previous_state.get("a_consecutive_failures", 0) or 0
-    )
-    payload["a_error_notified"] = bool(
-        previous_state.get("a_error_notified", False)
-    )
-    if previous_state.get("a_last_error_message"):
-        payload["a_last_error_message"] = previous_state["a_last_error_message"]
-    if previous_state.get("a_last_error_utc"):
-        payload["a_last_error_utc"] = previous_state["a_last_error_utc"]
+    for field in (
+        "telegram_update_id",
+        "manual_pending",
+        "a_consecutive_failures",
+        "a_error_notified",
+        "a_last_error_message",
+        "a_last_error_utc",
+    ):
+        if field in previous_state:
+            payload[field] = previous_state[field]
 
     write_state(payload)
 
 
 def update_a_health(state, error=None):
-    """
-    O filtro A1-A6 não derruba o monitor principal B1/B2.
-
-    Se A falhar, preservamos o último estado conhecido. Só depois de duas
-    execuções consecutivas avisamos que o filtro de 1 quarto está degradado.
-    """
     updated = dict(state)
 
     if error is None:
@@ -961,7 +788,7 @@ def update_a_health(state, error=None):
                 "✅ FILTRO DE 1 QUARTO VOLTOU AO NORMAL\n\n"
                 f"Horário: {local_time_text()}\n"
                 "A1-A6 voltaram a ser consultados normalmente. "
-                "O monitor B1/B2 permaneceu funcionando durante o problema."
+                "B1/B2 permaneceram ativos durante o problema."
             )
         elif had_failures:
             print("Falha isolada do filtro A1-A6 resolvida silenciosamente.")
@@ -972,39 +799,26 @@ def update_a_health(state, error=None):
     updated["a_consecutive_failures"] = count
     updated["a_last_error_message"] = clean_error(error)
     updated["a_last_error_utc"] = utc_now().isoformat()
-
     already_notified = bool(updated.get("a_error_notified", False))
 
     if count >= ERROR_FAILURE_THRESHOLD and not already_notified:
         send_telegram(
             "⚠️ FILTRO DE 1 QUARTO TEMPORARIAMENTE INDISPONÍVEL\n\n"
             f"Horário: {local_time_text()}\n"
-            "Não consegui atualizar A1-A6 em 2 execuções consecutivas.\n"
-            "O monitor de B1/B2 continua funcionando normalmente.\n\n"
+            "Uma ou mais plantas A falharam em 2 execuções consecutivas.\n"
+            "B1/B2 continuam funcionando normalmente.\n\n"
             "Vou continuar tentando e aviso quando A1-A6 voltarem."
         )
         updated["a_error_notified"] = True
     elif count < ERROR_FAILURE_THRESHOLD:
-        print(
-            "Falha isolada no filtro A1-A6. "
-            "B1/B2 continuam ativos e nenhum alerta foi enviado."
-        )
+        print("Falha isolada no filtro A1-A6; nenhum alerta enviado.")
 
     return updated
 
 
 def record_failure(exc):
-    """
-    Uma falha isolada NÃO vira alerta.
-
-    Só avisamos no Telegram quando DUAS execuções diferentes do GitHub falham
-    seguidas. Isso força uma confirmação em outra VM/região/IP antes de dizer
-    que o monitor realmente está com problema.
-    """
     state = load_state()
     error_text = clean_error(exc)
-
-    old_status = state.get("monitor_status")
     legacy_notified = legacy_error_was_notified(state)
 
     try:
@@ -1012,58 +826,58 @@ def record_failure(exc):
     except Exception:
         previous_count = 0
 
-    # Migração do estado antigo: se ele já estava marcado como erro e o usuário
-    # já recebeu alerta, não enviamos outro alerta só porque trocou o código.
     if legacy_notified and previous_count == 0:
         previous_count = ERROR_FAILURE_THRESHOLD
 
     failure_count = previous_count + 1
-
     state["consecutive_failures"] = failure_count
     state["last_error_utc"] = utc_now().isoformat()
     state["last_error_message"] = error_text
     state["updated_at_utc"] = utc_now().isoformat()
-
     already_notified = bool(state.get("error_notified", legacy_notified))
 
     if failure_count >= ERROR_FAILURE_THRESHOLD:
         state["monitor_status"] = "error"
-
         if not already_notified:
-            last_success = state.get("last_success_utc", "desconhecida")
-
             try:
                 send_telegram(
                     "⚠️ MONITOR BAINBRIDGE COM PROBLEMA\n\n"
-                    "A disponibilidade não pôde ser lida em "
-                    f"{failure_count} execuções consecutivas do GitHub.\n"
+                    f"Falha confirmada em {failure_count} execuções consecutivas.\n"
                     f"Horário: {local_time_text()}\n"
-                    f"Última leitura bem-sucedida: {last_success}\n\n"
-                    "Vou continuar tentando automaticamente. "
-                    "Não repetirei este alerta até o monitor voltar ao normal."
+                    f"Última leitura bem-sucedida: {state.get('last_success_utc', 'desconhecida')}\n\n"
+                    "Vou continuar tentando automaticamente e não repetirei este alerta "
+                    "até o monitor voltar ao normal."
                 )
                 state["error_notified"] = True
             except Exception as telegram_exc:
-                print(
-                    f"Também não consegui enviar o alerta: {telegram_exc}",
-                    file=sys.stderr,
-                )
+                print(f"Também não consegui enviar o alerta: {telegram_exc}", file=sys.stderr)
         else:
             state["error_notified"] = True
-            print(
-                f"Falha consecutiva #{failure_count}; "
-                "o usuário já foi avisado, então não repeti a notificação."
-            )
-
     else:
         state["monitor_status"] = "degraded"
         state["error_notified"] = False
-        print(
-            "Falha isolada nesta execução. "
-            "Nenhum alerta enviado; vou confirmar no próximo GitHub runner."
-        )
+        print("Falha isolada; vou confirmar na próxima execução antes de alertar.")
 
     write_state(state)
+
+
+def fetch_all_a_plans(old_units):
+    """Consulta A1-A6 diretamente. Sem página-index intermediária e sem regex de cards."""
+    units = {}
+    errors = []
+
+    for plan in A_PLANS:
+        try:
+            units.update(fetch_floorplan(plan))
+        except Exception as exc:
+            errors.append(f"{plan}: {clean_error(exc)}")
+            print(f"{plan}: falha no filtro A: {exc}", file=sys.stderr)
+            # Preserva apenas o estado antigo da planta que falhou, evitando falso desaparecimento.
+            for key, unit in old_units.items():
+                if unit.get("plan") == plan:
+                    units[key] = unit
+
+    return units, errors
 
 
 def main():
@@ -1093,34 +907,29 @@ def main():
         try:
             send_telegram(
                 "⏳ PEDIDO RECEBIDO\n\n"
-                "Vou consultar os dois filtros agora. "
+                "Vou consultar B1/B2 e A1-A6 agora. "
                 "O resultado chega assim que esta execução terminar."
             )
         except Exception as exc:
             print(f"Não consegui enviar confirmação do botão: {exc}", file=sys.stderr)
 
+    # B1/B2 são o monitor principal. Se uma dessas duas falhar por HTTP e Chrome,
+    # a execução é considerada falha e só alertamos após 2 falhas consecutivas.
     new_units = {}
-    for plan in FLOORPLANS:
+    for plan in B_PLANS:
         new_units.update(fetch_floorplan(plan))
 
-    # 1 quarto: o filtro A1-A6 tem saúde independente. Se ele falhar,
-    # B1/B2 continuam sendo monitorados e preservamos o último estado A.
-    a_error = None
-    try:
-        new_units.update(fetch_a_monitor_units(old_units))
+    # A1-A6 têm saúde independente para nunca derrubar B1/B2.
+    a_units, a_errors = fetch_all_a_plans(old_units)
+    new_units.update(a_units)
+    a_available = not a_errors
+
+    if a_errors:
+        a_error = RuntimeError("; ".join(a_errors))
+        old_state = update_a_health(old_state, error=a_error)
+    else:
         old_state = update_a_health(old_state, error=None)
-    except Exception as exc:
-        a_error = exc
-        print(f"Filtro A1-A6 falhou: {exc}", file=sys.stderr)
 
-        # Não gere falso alerta de desaparecimento durante uma falha de leitura.
-        for key, unit in old_units.items():
-            if unit.get("plan") in A_PLANS:
-                new_units[key] = unit
-
-        old_state = update_a_health(old_state, error=exc)
-
-    # Persiste a saúde do filtro A mesmo quando não houve mudança de unidade.
     old_state["updated_at_utc"] = utc_now().isoformat()
     write_state(old_state)
 
@@ -1131,7 +940,7 @@ def main():
             f"• B1/B2: até {money(MAX_RENT)}\n"
             f"• A1-A6: menos de {money(A_MAX_RENT)}\n"
             "Verificação: aproximadamente a cada 5 minutos\n\n"
-            + current_summary(new_units)
+            + current_summary(new_units, a_available=a_available)
         )
         send_telegram(message)
         save_success_state(new_units, old_state)
@@ -1146,24 +955,17 @@ def main():
         recovery = (
             "✅ MONITOR BAINBRIDGE VOLTOU AO NORMAL\n\n"
             f"Horário: {local_time_text()}\n"
-            "A consulta dos dois filtros voltou a funcionar normalmente."
+            "B1/B2 voltaram a ser consultados normalmente."
         )
         send_telegram(recovery)
         print(recovery)
 
     if manual_request:
-        a_note = (
-            "\n\n⚠️ A1-A6 não puderam ser atualizados nesta consulta; "
-            "o bloco de 1 quarto mostra o último estado conhecido."
-            if a_error is not None
-            else ""
-        )
         message = (
             "🔎 CONSULTA MANUAL BAINBRIDGE\n\n"
             f"Horário: {local_time_text()}\n"
             "Consulta concluída.\n\n"
-            + current_summary(new_units)
-            + a_note
+            + current_summary(new_units, a_available=a_available)
         )
         send_telegram(message)
         print(message)
@@ -1176,13 +978,7 @@ def main():
             "🚨 BAINBRIDGE THE GRAND\n\n"
             + format_event_sections(events)
             + "\n\n📋 SITUAÇÃO ATUAL\n\n"
-            + current_summary(new_units)
-            + (
-                "\n\n⚠️ A1-A6 não puderam ser atualizados nesta execução; "
-                "o bloco de 1 quarto mantém o último estado conhecido."
-                if a_error is not None
-                else ""
-            )
+            + current_summary(new_units, a_available=a_available)
         )
         send_telegram(message)
         print(message)
@@ -1193,9 +989,9 @@ def main():
         else:
             print("Sem mudanças relevantes. Nenhuma notificação enviada.")
 
-    # Sem heartbeat. Salvamos quando houve mudança OU quando precisamos zerar
-    # o contador de falhas de uma execução anterior.
-    if old_units != new_units or had_failed_check:
+    # A saúde do filtro A já foi persistida acima. O estado completo só precisa
+    # ser regravado quando o inventário mudou, houve recuperação ou pedido manual.
+    if old_units != new_units or had_failed_check or manual_request:
         save_success_state(new_units, old_state)
 
 
