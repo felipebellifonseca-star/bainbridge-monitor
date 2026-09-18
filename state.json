@@ -3,11 +3,13 @@
   "a_error_notified": false,
   "a_failed_plans": [],
   "a_max_rent": 1800,
-  "consecutive_failures": 0,
+  "consecutive_failures": 1,
   "error_notified": false,
+  "last_error_message": "Falha ao consultar B1 após 2 tentativas: a página abriu, mas o estado visível não ficou estável: cabeçalho=não reconhecido, sem unidades visíveis | a página abriu, mas o estado visível não ficou estável: cabeçalho=não reconhecido, sem unidades visíveis",
+  "last_error_utc": "2026-09-18T13:22:37.500832+00:00",
   "last_success_utc": "2026-09-17T01:57:10.880892+00:00",
   "max_rent": 2700,
-  "monitor_status": "ok",
+  "monitor_status": "degraded",
   "telegram_update_id": 879278917,
   "units": {
     "A2-1133": {
@@ -173,5 +175,5 @@
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     }
   },
-  "updated_at_utc": "2026-09-18T06:48:31.483065+00:00"
+  "updated_at_utc": "2026-09-18T13:22:37.500853+00:00"
 }
