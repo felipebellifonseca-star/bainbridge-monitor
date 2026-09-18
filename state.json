@@ -10,15 +10,6 @@
   "monitor_status": "ok",
   "telegram_update_id": 879278917,
   "units": {
-    "A1-4165": {
-      "availability": "Jan 09",
-      "floor": 4,
-      "plan": "A1",
-      "price": 1985,
-      "sqft": 687,
-      "unit": "4165",
-      "url": "https://bainbridgegrand.com/floorplans/a1/"
-    },
     "A2-1133": {
       "availability": "Jan 12",
       "floor": 1,
@@ -26,15 +17,6 @@
       "price": 2160,
       "sqft": 800,
       "unit": "1133",
-      "url": "https://bainbridgegrand.com/floorplans/a2/"
-    },
-    "A2-1159": {
-      "availability": "Jan 09",
-      "floor": 1,
-      "plan": "A2",
-      "price": 2160,
-      "sqft": 800,
-      "unit": "1159",
       "url": "https://bainbridgegrand.com/floorplans/a2/"
     },
     "B1-1119": {
@@ -200,5 +182,5 @@
       "url": "https://bainbridgegrand.com/floorplans/b2/"
     }
   },
-  "updated_at_utc": "2026-09-18T17:45:29.578421+00:00"
+  "updated_at_utc": "2026-09-18T17:51:39.777766+00:00"
 }
